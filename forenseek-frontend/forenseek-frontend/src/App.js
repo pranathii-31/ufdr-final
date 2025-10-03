@@ -2,7 +2,7 @@
 import React, { useState } from 'react';
 import { Search, Shield, Bell, Volume2, Filter, Download, Upload, Share2, Mic, LogOut, BarChart3, FileText, User, Settings, Clock } from 'lucide-react';
 import { 
-  login, signup, searchQuery, rebuildIndex, uploadFiles, 
+  login, signup, searchQuery as searchApi, rebuildIndex, uploadFiles, 
   exportPDF, getAnalytics, saveChatMessage, getAuditLogs 
 } from './api/api';
 import ChatHistory from './components/ChatHistory';
@@ -14,7 +14,7 @@ const ForenseekApp = () => {
   const [user, setUser] = useState(null);
   const { language, setLanguage, translations: t } = useLanguage();
   const [activeView, setActiveView] = useState('login'); // Sign in shows first
-  const [searchQuery, setSearchQuery] = useState('');
+  const [queryText, setQueryText] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [loading, setLoading] = useState(false);
   const [showFilters, setShowFilters] = useState(false);
@@ -32,6 +32,7 @@ const ForenseekApp = () => {
   const [chatMessages, setChatMessages] = useState([]);
   const [voiceActive, setVoiceActive] = useState(false);
   const [gpsPoints, setGpsPoints] = useState([]);
+  const [assistantText, setAssistantText] = useState('');
   const [analyticsData, setAnalyticsData] = useState(null);
   const [latestSessionId, setLatestSessionId] = useState(null);
 
@@ -80,31 +81,38 @@ const ForenseekApp = () => {
 
   const handleSearch = async (e) => {
     e?.preventDefault();
-    if (!searchQuery.trim()) {
+    if (!queryText.trim()) {
       alert('Please enter a search query');
       return;
     }
     setLoading(true);
     try {
-      console.log('Searching for:', searchQuery);
-      const response = await searchQuery(searchQuery, filters, language);
+      console.log('Searching for:', queryText);
+      const response = await searchApi(queryText, filters, language);
       console.log('Search response:', response);
       
       // Backend returns answer, sources, gps, session_id
-      const results = response.sources || [];
+      let results = response.sources || [];
       const gps = response.gps || [];
+      setAssistantText(response.answer || '');
       
-      if (results.length === 0) {
-        alert('No results found. Try a different search query.');
-        setLoading(false);
-        return;
+      // If no structured sources but we do have an answer, surface it as a synthetic card
+      if (results.length === 0 && response.answer) {
+        results = [{
+          id: 'answer',
+          title: 'Answer',
+          snippet: response.answer,
+          relevance: 1,
+          date: '',
+          type: 'Response'
+        }];
       }
 
       setGpsPoints(gps);
       setSearchResults(results);
       
       const newChat = [
-        { type: 'user', text: searchQuery },
+        { type: 'user', text: queryText },
         { type: 'ai', text: response.answer, results, session_id: response.session_id }
       ];
       
@@ -112,7 +120,7 @@ const ForenseekApp = () => {
       
       // persist chat to backend
       try {
-        await saveChatMessage(response.session_id, { query: searchQuery, answer: response.answer, sources: results });
+        await saveChatMessage(response.session_id, { query: queryText, answer: response.answer, sources: results });
       } catch (err) {
         console.warn('Failed to save chat message', err);
       }
@@ -296,7 +304,7 @@ const ForenseekApp = () => {
       recognition.onend = () => setVoiceActive(false);
       recognition.onresult = (event) => {
         const transcript = event.results[0][0].transcript;
-        setSearchQuery(transcript);
+        setQueryText(transcript);
       };
       recognition.start();
     } else {
@@ -470,7 +478,7 @@ const ForenseekApp = () => {
                   <div className="flex gap-2">
                     <div className="flex-1 relative">
                       <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-                      <input type="text" value={searchQuery} onChange={e => setSearchQuery(e.target.value)}
+                      <input type="text" value={queryText} onChange={e => setQueryText(e.target.value)}
                         placeholder={t.searchPlaceholder}
                         className="w-full pl-10 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
                     </div>
@@ -540,10 +548,13 @@ const ForenseekApp = () => {
                 </form>
               </div>
 
-              {/* Chat messages */}
-              <div className="bg-white rounded-lg shadow-md">
-                <ChatHistory sessionId={latestSessionId} />
-              </div>
+              {/* Assistant answer */}
+              {assistantText && (
+                <div className="bg-white rounded-lg shadow-md p-6">
+                  <h2 className="text-xl font-bold text-gray-900 mb-2">Assistant</h2>
+                  <p className="whitespace-pre-line text-gray-800">{assistantText}</p>
+                </div>
+              )}
 
               {/* Search results */}
               {searchResults.length > 0 && (

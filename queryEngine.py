@@ -76,145 +76,417 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def query(q: str, vector_store, db=None, language: str = 'en') -> Dict[str, Any]:
-    """Enhanced natural language search with uploaded files support."""
+# --- Robust JSON loading helpers ---
+def _load_json_safely(filepath: str):
+    """Load JSON from filepath.
+
+    Tries standard JSON first. If that fails, attempts to parse as NDJSON (one JSON object per line)
+    or multiple concatenated JSON objects. Returns either a dict or a list of dicts.
+    """
     try:
-        # Get all JSON files (both hardcoded and uploaded)
-        json_files = []
-        
-        # Check for hardcoded files
-        hardcoded_files = ["ufdr_report_1.json", "ufdr_report_2.json", "ufdr_report_3.json"]
-        for filename in hardcoded_files:
-            if os.path.exists(filename):
-                json_files.append(filename)
-        
-        # Check for uploaded files in uploads directory
-        uploads_dir = "uploads"
-        if os.path.exists(uploads_dir):
-            for filename in os.listdir(uploads_dir):
-                if filename.endswith('.json'):
-                    json_files.append(os.path.join(uploads_dir, filename))
-        
-        if not json_files:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        # Try NDJSON (newline-delimited JSON)
+        objs: List[dict] = []
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        objs.append(obj)
+                    except Exception:
+                        # Not a pure NDJSON line; fall back to concatenated parsing later
+                        objs = []
+                        break
+            if objs:
+                return objs
+        except Exception:
+            pass
+
+        # Try to split concatenated JSON objects by '}{' boundary
+        try:
+            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                data = f.read()
+            # Insert a comma between '}{' and wrap with brackets to form a JSON array
+            candidate = '[' + data.replace('}\n{', '},{').replace('}{', '},{') + ']'
+            return json.loads(candidate)
+        except Exception as e:
+            raise ValueError(f"Unable to parse JSON file '{os.path.basename(filepath)}': {e}")
+
+def query(q: str, vector_store, db=None, language: str = 'en') -> Dict[str, Any]:
+    """Enhanced natural language search focused on the most recently uploaded file.
+
+    Strategy:
+    - Prefer the newest JSON file in uploads/ (single-file focus)
+    - Fall back to hardcoded ufdr_report_*.json if uploads is empty
+    - Answer domain questions with rule-based extractors (case/device/owner/wallets/contacts)
+    """
+    try:
+        target_path = _pick_target_file()
+        if not target_path:
             return {
                 "answer": "No data files found. Please upload JSON files first.",
                 "sources": [],
                 "gps": [],
                 "session_id": str(time.time())
             }
-        
-        results = []
-        
-        # Process each JSON file
-        for filepath in json_files:
-            try:
-                with open(filepath, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    
-                # Handle different JSON structures
-                if isinstance(data, list):
-                    # If it's a list of cases
-                    for case in data:
-                        content = json.dumps(case, separators=(',', ':'))
-                        if _matches_query(q, content, case):
-                            results.append({
-                                'content': content,
-                                'metadata': _extract_metadata(case, filepath)
-                            })
-                elif isinstance(data, dict):
-                    # If it's a single case or structured data
-                    content = json.dumps(data, separators=(',', ':'))
-                    if _matches_query(q, content, data):
-                        results.append({
-                            'content': content,
-                            'metadata': _extract_metadata(data, filepath)
-                        })
-                        
-            except Exception as e:
-                print(f"Error processing {filepath}: {e}")
-                continue
-        
-        if not results:
-            return {
-                "answer": f"No relevant information found for '{q}'. Try searching for: fraud, cybercrime, homicide, case numbers, locations, or evidence types.",
-                "sources": [],
-                "gps": [],
-                "session_id": str(time.time())
-            }
-        
-        # Sort by relevance (simple scoring)
-        results = sorted(results, key=lambda x: _calculate_relevance(q, x['content']), reverse=True)
-        
-        # Format response
-        sources = []
-        gps_coords = []
-        
-        for result in results[:5]:  # Limit to top 5
-            metadata = result['metadata']
-            content = result['content']
-            
-            # Create formatted source entry
-            source_entry = {
-                "title": f"Case {metadata.get('case_id', metadata.get('id', 'Unknown'))}",
-                "snippet": _create_snippet(content, q),
-                "relevance": min(0.95, _calculate_relevance(q, content)),
-                "date": metadata.get('date', metadata.get('incident_date', 'Unknown')),
-                "type": metadata.get('incident_type', metadata.get('type', 'Unknown')),
-                "id": metadata.get('case_id', metadata.get('id', 'Unknown'))
-            }
-            sources.append(source_entry)
-            
-            # Extract GPS coordinates
-            coords = metadata.get('coordinates', metadata.get('location', {}).get('coordinates', {}))
-            if coords and isinstance(coords, dict) and 'lat' in coords and 'lon' in coords:
-                gps_coords.append({
-                    "lat": coords['lat'],
-                    "lon": coords['lon'],
-                    "source": metadata.get('source', 'Unknown')
-                })
-        
-        # Create comprehensive answer
-        answer_parts = []
-        for i, result in enumerate(results[:3]):
-            answer_parts.append(f"**Result {i+1}:** {_create_snippet(result['content'], q, 400)}")
-        
-        answer_text = "\n\n".join(answer_parts)
+        data = _load_json_safely(target_path)
+        context = _build_context(data)
+        answer = _answer_question(q, context)
 
+        # Basic source card for UI
+        src = _context_to_source_card(context, target_path)
         return {
-            "answer": answer_text,
-            "sources": sources,
-            "gps": gps_coords,
+            "answer": answer or f"No direct answer found for '{q}'. Try rephrasing or different keywords.",
+            "sources": [src] if src else [],
+            "gps": context.get('gps', []),
             "session_id": str(time.time())
         }
     except Exception as e:
         print(f"Search error: {str(e)}")
         raise ValueError(f"Search failed: {str(e)}")
 
-def _matches_query(query: str, content: str, data: dict) -> bool:
-    """Check if content matches the query using various matching strategies."""
-    query_lower = query.lower()
-    content_lower = content.lower()
-    
-    # Direct keyword matching
-    keywords = query_lower.split()
-    if any(keyword in content_lower for keyword in keywords):
-        return True
-    
-    # Semantic matching for common terms
-    semantic_map = {
-        'fraud': ['financial', 'money', 'theft', 'embezzlement', 'scam'],
-        'cybercrime': ['hacking', 'phishing', 'malware', 'data breach', 'cyber'],
-        'homicide': ['murder', 'killing', 'death', 'fatal'],
-        'theft': ['stealing', 'robbery', 'burglary', 'larceny'],
-        'assault': ['attack', 'violence', 'battery', 'harm']
+# ------------------- Target file selection -------------------
+def _pick_target_file() -> Optional[str]:
+    uploads_dir = "uploads"
+    if os.path.isdir(uploads_dir):
+        jsons = [os.path.join(uploads_dir, f) for f in os.listdir(uploads_dir) if f.lower().endswith('.json')]
+        if jsons:
+            jsons.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+            return jsons[0]
+    for name in ["ufdr_report_1.json", "ufdr_report_2.json", "ufdr_report_3.json"]:
+        if os.path.isfile(name):
+            return name
+    return None
+
+# ------------------- Context builders -------------------
+def _build_context(data: Any) -> dict:
+    # If list, consider first dict as primary case
+    case = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else data if isinstance(data, dict) else {}
+    ctx: dict = {
+        'case_id': _find_value(case, ["case_id", "caseid", "caseId", "caseID"]),
+        'extraction_date': _find_value(case, ["extraction_date", "extractiondate", "extracted_at", "date", "extractionDate"]),
+        'device_model': _find_value(case, ["device_model", "model", "device", "devicename"]),
+        'os_version': _find_value(case, ["os_version", "osversion", "os", "android_version", "ios_version"]),
+        'imei': _find_value(case, ["imei", "IMEI"]),
+        'serial': _find_value(case, ["serial", "serialnumber", "serial_number", "serialNumber"]),
+        'timezone': _find_value(case, ["timezone", "time_zone", "tz"]),
+        'owner': _find_object(case, ["owner", "ownerinfo", "device_owner", "user", "deviceOwner"]),
+        'wallets': _find_list(case, ["shared_wallets", "wallets", "sharedWallets"]),
+        'contacts': _extract_contacts(case),
+        'gps': _extract_gps(case),
     }
-    
-    for term, synonyms in semantic_map.items():
-        if term in query_lower:
-            if any(syn in content_lower for syn in synonyms):
-                return True
-    
-    return False
+    return ctx
+
+def _extract_gps(d: Any) -> List[dict]:
+    pts: List[dict] = []
+    def walk(x: Any):
+        if isinstance(x, dict):
+            if set(x.keys()) >= {"lat", "lon"}:
+                try:
+                    pts.append({"lat": float(x["lat"]), "lon": float(x["lon"])})
+                except Exception:
+                    pass
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(d)
+    return pts
+
+def _extract_contacts(d: Any) -> List[dict]:
+    contacts: List[dict] = []
+    def is_contact(obj: dict) -> bool:
+        keys = {k.lower() for k in obj.keys()}
+        return (
+            'name' in keys and ('phone' in keys or 'phonenumber' in keys or 'phone_number' in keys or 'number' in keys or 'email' in keys)
+        ) or ('first_name' in keys or 'last_name' in keys)
+    def normalize(obj: dict) -> dict:
+        name = obj.get('name') or ' '.join(filter(None, [obj.get('first_name'), obj.get('last_name')]))
+        return {
+            'name': str(name or '').strip(),
+            'phone': str(obj.get('phonenumber') or obj.get('phone') or obj.get('phone_number') or obj.get('number') or '').strip(),
+            'email': str(obj.get('email') or obj.get('mail') or '').strip()
+        }
+    def walk(x: Any):
+        if isinstance(x, dict):
+            if is_contact(x):
+                contacts.append(normalize(x))
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                if isinstance(v, dict) and is_contact(v):
+                    contacts.append(normalize(v))
+                walk(v)
+    walk(d)
+    # dedupe
+    seen = set()
+    uniq = []
+    for c in contacts:
+        key = (c['name'], c['phone'], c['email'])
+        if key not in seen:
+            seen.add(key)
+            uniq.append(c)
+    return uniq
+
+def _find_value(d: Any, keys: List[str]) -> Optional[str]:
+    if not isinstance(d, (dict, list)):
+        return None
+    def walk(x: Any) -> Optional[str]:
+        if isinstance(x, dict):
+            for k in keys:
+                if k in x and isinstance(x[k], (str, int, float)):
+                    return str(x[k])
+            for v in x.values():
+                r = walk(v)
+                if r is not None:
+                    return r
+        elif isinstance(x, list):
+            for v in x:
+                r = walk(v)
+                if r is not None:
+                    return r
+        return None
+    return walk(d)
+
+def _find_object(d: Any, keys: List[str]) -> dict:
+    if not isinstance(d, (dict, list)):
+        return {}
+    def walk(x: Any) -> Optional[dict]:
+        if isinstance(x, dict):
+            for k in keys:
+                if k in x and isinstance(x[k], dict):
+                    return x[k]
+            for v in x.values():
+                r = walk(v)
+                if r is not None:
+                    return r
+        elif isinstance(x, list):
+            for v in x:
+                r = walk(v)
+                if r is not None:
+                    return r
+        return None
+    return walk(d) or {}
+
+def _find_list(d: Any, keys: List[str]) -> List[Any]:
+    if not isinstance(d, (dict, list)):
+        return []
+    def walk(x: Any) -> Optional[List[Any]]:
+        if isinstance(x, dict):
+            for k in keys:
+                if k in x and isinstance(x[k], list):
+                    return x[k]
+            for v in x.values():
+                r = walk(v)
+                if r is not None:
+                    return r
+        elif isinstance(x, list):
+            for v in x:
+                r = walk(v)
+                if r is not None:
+                    return r
+        return None
+    return walk(d) or []
+
+# ------------------- Question answering -------------------
+def _answer_question(q: str, ctx: dict) -> str:
+    qt = q.lower().strip()
+
+    # Case & Device Information
+    if "case id" in qt and ("extraction" in qt or "date" in qt):
+        return f"Case ID: {ctx.get('case_id') or 'N/A'}; Extraction date: {ctx.get('extraction_date') or 'N/A'}."
+    if ("device" in qt and ("os" in qt or "version" in qt)) or ("which device" in qt):
+        return f"Device: {ctx.get('device_model') or 'N/A'}; OS version: {ctx.get('os_version') or 'N/A'}."
+    if ("imei" in qt) or ("serial" in qt):
+        return f"IMEI: {ctx.get('imei') or 'N/A'}; Serial: {ctx.get('serial') or 'N/A'}."
+    if "timezone" in qt:
+        return f"Extraction timezone: {ctx.get('timezone') or 'N/A'}."
+
+    # Owner Information
+    if "owner" in qt and ("who" in qt or "name" in qt):
+        name = _find_value(ctx.get('owner') or {}, ["name", "owner_name", "full_name"]) or 'N/A'
+        return f"Owner: {name}."
+    if "owner" in qt and ("phone" in qt or "email" in qt):
+        phone = _find_value(ctx.get('owner') or {}, ["phone", "phone_number", "number"]) or 'N/A'
+        email = _find_value(ctx.get('owner') or {}, ["email", "mail"]) or 'N/A'
+        return f"Owner phone: {phone}; email: {email}."
+    if "owner" in qt and ("contact" in qt or "appear" in qt):
+        oname = _find_value(ctx.get('owner') or {}, ["name", "owner_name", "full_name"]) or ''
+        present = any(c.get('name','').lower() == oname.lower() for c in ctx.get('contacts', [])) if oname else False
+        return f"Owner present in contacts: {'Yes' if present else 'No'}."
+
+    # Shared wallets
+    if "wallet" in qt:
+        wl = ctx.get('wallets') or []
+        if "how many" in qt or "count" in qt:
+            return f"Shared wallets linked: {len(wl)}."
+        if "id" in qt:
+            wids = []
+            for w in wl:
+                if isinstance(w, dict):
+                    wid = _find_value(w, ["id", "wallet_id"]) or ''
+                    if wid:
+                        wids.append(wid)
+            return "Wallet IDs: " + (", ".join(wids) if wids else "N/A")
+
+    # Contacts
+    contacts = ctx.get('contacts', [])
+    if "how many" in qt and "contact" in qt:
+        return f"Total contacts: {len(contacts)}."
+    if "gmail" in qt:
+        gl = [c for c in contacts if c.get('email','').lower().endswith('@gmail.com')]
+        return _list_contacts(gl, header="Contacts with Gmail:")
+    if "+91" in qt or "starting with +91" in qt:
+        gl = [c for c in contacts if c.get('phone','').strip().startswith('+91')]
+        return _list_contacts(gl, header="Contacts with +91:")
+    if "outlook" in qt:
+        gl = [c for c in contacts if c.get('email','').lower().endswith('@outlook.com') or c.get('email','').lower().endswith('@outlook.in')]
+        return _list_contacts(gl, header="Outlook contacts:")
+    if "rediff" in qt:
+        gl = [c for c in contacts if 'rediff' in c.get('email','').lower()]
+        return _list_contacts(gl, header="Rediffmail contacts:")
+    if "yahoo" in qt:
+        gl = [c for c in contacts if c.get('email','').lower().endswith('@yahoo.com')]
+        return _list_contacts(gl, header="Yahoo contacts:")
+    if "international" in qt or "non-indian" in qt or "foreign" in qt:
+        gl = [c for c in contacts if (ph := c.get('phone','')).startswith('+') and not ph.startswith('+91')]
+        return _list_contacts(gl, header="International contacts:")
+    if "duplicate first name" in qt or "same first name" in qt:
+        from collections import Counter
+        firsts = [c.get('name','').split()[0] for c in contacts if c.get('name')]
+        cnt = Counter([f for f in firsts if f])
+        dups = [f"{k} ({v})" for k, v in cnt.items() if v > 1]
+        return "Duplicate first names: " + (", ".join(dups) if dups else "None")
+    if "contacts named" in qt:
+        import re as _re
+        m = _re.search(r"contacts named\s+\"?([A-Za-z]+)\"?", qt)
+        if m:
+            name = m.group(1).lower()
+            gl = [c for c in contacts if c.get('name','').lower().split()[0] == name]
+            return _list_contacts(gl, header=f"Contacts named {name.capitalize()}:")
+    if "starting with" in qt and 'name' in qt:
+        import re as _re
+        m = _re.search(r"starting with\s+\"?([A-Za-z])\"?", qt)
+        if m:
+            ch = m.group(1).lower()
+            gl = [c for c in contacts if c.get('name','').lower().startswith(ch)]
+            return _list_contacts(gl, header=f"Contacts starting with {ch.upper()}:")
+    if "unique" in qt and ("domain" in qt or "email" in qt):
+        common = {"gmail.com","outlook.com","outlook.in","yahoo.com","rediff.com","rediffmail.com"}
+        gl = []
+        for c in contacts:
+            em = c.get('email','').lower()
+            dom = em.split('@')[-1] if '@' in em else ''
+            if dom and dom not in common:
+                gl.append(c)
+        return _list_contacts(gl, header="Contacts with rare email domains:")
+
+    # Mixed queries
+    if "share a wallet" in qt or ("owner" in qt and "wallet" in qt):
+        oname = _find_value(ctx.get('owner') or {}, ["name", "owner_name", "full_name"]) or ''
+        wallet_text = json.dumps(ctx.get('wallets') or [])
+        present = oname and (oname.lower() in wallet_text.lower())
+        return f"Owner shares a wallet with a listed contact: {'Possibly' if present else 'Not evident'}" 
+    if "same last name as the owner" in qt:
+        oname = (_find_value(ctx.get('owner') or {}, ["name", "owner_name", "full_name"]) or '').split()
+        last = oname[-1].lower() if oname else ''
+        gl = [c for c in contacts if last and c.get('name','').lower().split()[-1] == last]
+        return _list_contacts(gl, header=f"Contacts with last name '{last.capitalize()}':")
+    if "same first name as the owner" in qt:
+        oname = (_find_value(ctx.get('owner') or {}, ["name", "owner_name", "full_name"]) or '').split()
+        first = oname[0].lower() if oname else ''
+        gl = [c for c in contacts if first and c.get('name','').lower().split()[0] == first]
+        return f"Contacts sharing owner's first name ({first.capitalize()}): {len(gl)}"
+
+    # Default fallback
+    return None
+
+def _list_contacts(items: List[dict], header: str) -> str:
+    if not items:
+        return header + " None"
+    lines = [header]
+    for c in items[:50]:
+        parts = [p for p in [c.get('name'), c.get('phone'), c.get('email')] if p]
+        lines.append(" - " + " | ".join(parts))
+    if len(items) > 50:
+        lines.append(f"(+{len(items)-50} more)")
+    return "\n".join(lines)
+
+# ------------------- Source card helper -------------------
+def _context_to_source_card(ctx: dict, filepath: str) -> Optional[dict]:
+    try:
+        title = f"Case {ctx.get('case_id') or os.path.basename(filepath)}"
+        snippet_parts = []
+        if ctx.get('device_model') or ctx.get('os_version'):
+            snippet_parts.append(f"Device: {ctx.get('device_model') or 'N/A'} | OS: {ctx.get('os_version') or 'N/A'}")
+        if ctx.get('extraction_date'):
+            snippet_parts.append(f"Extracted: {ctx.get('extraction_date')}")
+        owner = ctx.get('owner') or {}
+        if isinstance(owner, dict):
+            on = owner.get('name') or ''
+            if on:
+                snippet_parts.append(f"Owner: {on}")
+        snippet = " | ".join(snippet_parts) or "UFDR report"
+        return {
+            "id": ctx.get('case_id') or os.path.basename(filepath),
+            "title": title,
+            "snippet": snippet,
+            "relevance": 0.9,
+            "date": ctx.get('extraction_date') or '',
+            "type": 'UFDR Report'
+        }
+    except Exception:
+        return None
+
+def _matches_query(query: str, content: str, data: dict) -> bool:
+    """Stricter matching to avoid generic matches.
+
+    Require phrase match OR at least 2 whole-word hits, or 1 field hit.
+    """
+    q = query.strip().lower()
+    text = content.lower()
+    if not q:
+        return False
+
+    # Phrase match
+    if q in text:
+        return True
+
+    # Whole-word keyword hits
+    words = [w for w in re.split(r"\W+", q) if w]
+    if not words:
+        return False
+
+    def hits(hay: str) -> int:
+        return sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", hay))
+
+    text_hits = hits(text)
+
+    # Field-level hits
+    field_texts = []
+    for key in ("case_id", "incident_type", "date", "status", "assigned_officer"):
+        v = data.get(key)
+        if isinstance(v, str):
+            field_texts.append(v.lower())
+    loc = data.get("location")
+    if isinstance(loc, dict) and isinstance(loc.get("address"), str):
+        field_texts.append(loc["address"].lower())
+    for sub in (data.get("victim"), data.get("suspect")):
+        if isinstance(sub, dict):
+            for _, v in sub.items():
+                if isinstance(v, str):
+                    field_texts.append(v.lower())
+
+    field_hits = sum(hits(s) for s in field_texts)
+
+    return text_hits >= 2 or field_hits >= 1
 
 def _extract_metadata(data: dict, filepath: str) -> dict:
     """Extract metadata from case data."""
@@ -236,27 +508,42 @@ def _extract_metadata(data: dict, filepath: str) -> dict:
     
     return metadata
 
-def _calculate_relevance(query: str, content: str) -> float:
-    """Calculate relevance score for search results."""
-    query_lower = query.lower()
-    content_lower = content.lower()
-    
+def _calculate_relevance(query: str, content: str, data: dict | None = None) -> float:
+    """Weighted relevance based on phrase, word and field hits."""
+    q = query.lower().strip()
+    text = content.lower()
+    if not q:
+        return 0.0
+
     score = 0.0
-    
-    # Exact phrase match
-    if query_lower in content_lower:
-        score += 0.8
-    
-    # Keyword matches
-    keywords = query_lower.split()
-    matches = sum(1 for keyword in keywords if keyword in content_lower)
-    score += (matches / len(keywords)) * 0.6
-    
-    # Case ID matches (high priority)
-    if any(keyword.startswith('ufdr') or keyword.startswith('case') for keyword in keywords):
-        score += 0.3
-    
-    return min(1.0, score)
+    if q in text:
+        score += 0.6
+
+    words = [w for w in re.split(r"\W+", q) if w]
+    if words:
+        word_hits = sum(1 for w in words if re.search(rf"\b{re.escape(w)}\b", text))
+        score += min(0.3, (word_hits / max(1, len(words))) * 0.3)
+
+    field_hits = 0
+    if isinstance(data, dict):
+        fields = []
+        for key in ("case_id", "incident_type", "date", "status", "assigned_officer"):
+            v = data.get(key)
+            if isinstance(v, str):
+                fields.append(v.lower())
+        loc = data.get("location")
+        if isinstance(loc, dict) and isinstance(loc.get("address"), str):
+            fields.append(loc["address"].lower())
+        for s in fields:
+            for w in words:
+                if re.search(rf"\b{re.escape(w)}\b", s):
+                    field_hits += 1
+    score += min(0.2, field_hits * 0.05)
+
+    if any(w.startswith("ufdr") or w.startswith("case") for w in words):
+        score += 0.1
+
+    return max(0.0, min(1.0, score))
 
 def _create_snippet(content: str, query: str, max_length: int = 200) -> str:
     """Create a relevant snippet from content."""

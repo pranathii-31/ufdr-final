@@ -493,14 +493,15 @@ async def tts(session_id: str, current_user: models.User = Depends(get_current_u
 async def query_endpoint(request: QueryRequest, current_user: models.User = Depends(get_current_user)):
     global vector_store
     if vector_store is None:
-        # try to load existing index on-demand
+        # try to load existing simple index on-demand (no ML deps)
         vector_store = build_index.load_index_if_exists()
         if vector_store is None:
-            # last resort: try to build index (may be slow)
+            # last resort: try to build simple index (fast)
             try:
                 vector_store = build_index.build_and_save_index()
-            except Exception:
-                raise HTTPException(status_code=500, detail="Index not loaded")
+            except Exception as ie:
+                print(f"Index build/load failed: {ie}")
+                vector_store = {}
     try:
         db = SessionLocal()
         # pass language from request if provided
@@ -519,7 +520,14 @@ async def query_endpoint(request: QueryRequest, current_user: models.User = Depe
             "session_id": result.get('session_id')
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Return a safe, structured response instead of 500 so frontend doesn't break
+        print(f"Query error: {str(e)}")
+        return {
+            "answer": f"Search failed internally: {str(e)}",
+            "sources": [],
+            "gps": [],
+            "session_id": None
+        }
 
 # Signup endpoint
 @app.post("/signup", response_model=schemas.UserOut)

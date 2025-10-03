@@ -205,29 +205,33 @@ def build_and_save_index(json_files: Optional[List[str]] = None, index_path: str
 
 
 def load_index_if_exists(index_path: str = "ufdr_faiss_combined_index"):
-    # local imports
-    from langchain_community.vectorstores import FAISS
-    from langchain_huggingface import HuggingFaceEmbeddings
-    embedding_model = HuggingFaceEmbeddings(model_name=DEFAULT_EMBEDDING)
+    """Lightweight loader for the simplified text-based index.
 
-    # First try the provided index path
-    if os.path.isdir(index_path):
+    Returns metadata dict if present, otherwise None. Avoids importing ML libs.
+    """
+    metadata_file = os.path.join(index_path, "index_metadata.json")
+    if os.path.isfile(metadata_file):
         try:
-            vs = FAISS.load_local(index_path, embedding_model, allow_dangerous_deserialization=True)
-            print(f"Loaded existing index from {index_path}")
-            return vs
+            with open(metadata_file, 'r') as f:
+                meta = json.load(f)
+            print(f"Loaded simple index metadata from {metadata_file}")
+            return meta
         except Exception as e:
-            print(f"Failed to load existing index from {index_path}: {e}")
+            print(f"Failed to read index metadata: {e}")
+            return None
 
-    # Then try the hardcoded index path
+    # Also check legacy hardcoded path used earlier
     hardcoded_path = "ufdr_faiss_index"
-    if os.path.isdir(hardcoded_path) and hardcoded_path != index_path:
+    metadata_file2 = os.path.join(hardcoded_path, "index_metadata.json")
+    if os.path.isfile(metadata_file2):
         try:
-            vs = FAISS.load_local(hardcoded_path, embedding_model, allow_dangerous_deserialization=True)
-            print(f"Loaded existing hardcoded index from {hardcoded_path}")
-            return vs
+            with open(metadata_file2, 'r') as f:
+                meta = json.load(f)
+            print(f"Loaded simple index metadata from {metadata_file2}")
+            return meta
         except Exception as e:
-            print(f"Failed to load existing hardcoded index: {e}")
+            print(f"Failed to read hardcoded index metadata: {e}")
+            return None
 
     return None
 

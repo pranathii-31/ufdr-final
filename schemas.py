@@ -33,6 +33,8 @@ class UserOut(BaseModel):
 class QueryRequest(BaseModel):
     query: str
     language: Optional[str] = 'en'
+    # Allow extra filter fields sent by the frontend (dateFrom, dateTo, etc.)
+    model_config = {"extra": "allow"}
 
 
 class ChatMessage(BaseModel):
