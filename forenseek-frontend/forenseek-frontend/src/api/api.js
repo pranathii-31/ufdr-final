@@ -1,4 +1,4 @@
-const API_BASE = 'http://localhost:8000'; // Your backend base URL, adjust if deployed
+const API_BASE = 'http://127.0.0.1:8000'; // Your backend base URL, adjust if deployed
 
 function getAuthHeader() {
   const token = localStorage.getItem('token');

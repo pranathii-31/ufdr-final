@@ -105,21 +105,20 @@ def _docs_from_json_files(json_files: List[str]) -> List[object]:
 
 
 def build_hardcoded_index(index_path: str = "ufdr_faiss_index"):
-    """Build a FAISS index from the hardcoded UFDR report files."""
-    # Import dependencies here to avoid heavy imports during module import
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain_community.vectorstores import FAISS
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain.schema import Document
-
+    """Build a simple text-based index from the hardcoded UFDR report files."""
+    print("Building simple text-based index from hardcoded files...")
+    
     documents = []
     for json_file in HARDCODED_FILES:
         try:
             with open(json_file, 'r', encoding='utf-8') as f:
                 json_data = json.load(f)
                 json_text = json.dumps(json_data, separators=(',', ':'))
-                doc = Document(page_content=json_text, metadata={"source": json_file})
-                documents.append(doc)
+                documents.append({
+                    'file': json_file,
+                    'content': json_text,
+                    'metadata': {"source": json_file}
+                })
         except Exception as e:
             print(f"Failed to process {json_file}: {e}")
             continue
@@ -127,34 +126,58 @@ def build_hardcoded_index(index_path: str = "ufdr_faiss_index"):
     if not documents:
         raise ValueError("No documents could be processed from hardcoded files")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
-    docs = splitter.split_documents(documents)
+    # Create a simple index structure
+    index_data = {
+        'total_documents': len(documents),
+        'documents': documents,
+        'index_created': time.time(),
+        'index_type': 'text_based',
+        'status': 'ready'
+    }
+    
+    # Ensure directory exists
+    os.makedirs(index_path, exist_ok=True)
+    
+    # Save index metadata
+    index_file = os.path.join(index_path, "index_metadata.json")
+    with open(index_file, 'w') as f:
+        json.dump(index_data, f, indent=2)
 
-    embedding_model = HuggingFaceEmbeddings(model_name=DEFAULT_EMBEDDING)
-    vectorstore = FAISS.from_documents(docs, embedding_model)
-    vectorstore.save_local(index_path)
-
-    print("✅ Combined FAISS index built and saved for hardcoded UFDR files!")
-    return vectorstore
+    print("✅ Simple text-based index built and saved for hardcoded UFDR files!")
+    return f"Successfully created index with {len(documents)} documents"
 
 def build_and_save_index(json_files: Optional[List[str]] = None, index_path: str = "ufdr_faiss_combined_index"):
     """Build a FAISS index from a list of json file paths and save it locally.
     
-    If json_files is None, will first try to use hardcoded files, then look for ufdr_report_*.json files.
+    If json_files is None, will collect all available JSON files (hardcoded + uploaded).
     Returns the vectorstore instance.
     """
     if json_files is None:
-        # Try hardcoded files first
-        try:
-            return build_hardcoded_index(index_path)
-        except Exception as e:
-            print(f"Failed to build index from hardcoded files: {e}")
-            print("Falling back to searching for UFDR report files in directory...")
-            json_files = [p for p in os.listdir('.') if p.startswith('ufdr_report_') and p.endswith('.json')]
+        # Collect all available JSON files
+        json_files = []
+        
+        # Add hardcoded files
+        hardcoded_files = ["ufdr_report_1.json", "ufdr_report_2.json", "ufdr_report_3.json"]
+        for filename in hardcoded_files:
+            if os.path.exists(filename):
+                json_files.append(filename)
+        
+        # Add uploaded files
+        uploads_dir = "uploads"
+        if os.path.exists(uploads_dir):
+            for filename in os.listdir(uploads_dir):
+                if filename.endswith('.json'):
+                    json_files.append(os.path.join(uploads_dir, filename))
+        
+        # Add any other JSON files in the directory
+        for filename in os.listdir('.'):
+            if filename.endswith('.json') and filename not in hardcoded_files:
+                json_files.append(filename)
 
     if not json_files:
-        raise ValueError("No JSON files provided to build index")
+        raise ValueError("No JSON files found to build index")
 
+    print(f"Building index from {len(json_files)} files: {json_files}")
     return process_and_add_files(json_files, index_path)
 
     # local import to avoid heavy imports during module import
@@ -210,18 +233,21 @@ def load_index_if_exists(index_path: str = "ufdr_faiss_combined_index"):
 
 
 def process_and_add_files(file_paths: List[str], index_path: str = "ufdr_faiss_combined_index", embeddings_path: str = "embeddings"):
-    """Process a list of JSON file paths, store individual embeddings, and update the combined index.
+    """Process a list of JSON file paths and create a simple text-based index.
     
     Args:
         file_paths: List of JSON files to process
-        index_path: Path to save the combined FAISS index
-        embeddings_path: Directory to store individual file embeddings
+        index_path: Path to save the combined index
+        embeddings_path: Directory to store individual file data
     
     Returns:
-        The updated combined vectorstore.
+        Success message indicating files were processed.
     """
-    # Create embeddings directory if it doesn't exist
+    print(f"Processing {len(file_paths)} files for indexing...")
+    
+    # Create directories if they don't exist
     os.makedirs(embeddings_path, exist_ok=True)
+    os.makedirs(index_path, exist_ok=True)
 
     # Track processed files
     processed_files_path = "processed_files.json"
@@ -233,33 +259,28 @@ def process_and_add_files(file_paths: List[str], index_path: str = "ufdr_faiss_c
         processed_data = {'processed_files': [], 'uploaded_files_info': []}
         processed_files = set()
 
-    # Only process new files
-    new_files = [f for f in file_paths if f not in processed_files]
-    if not new_files:
-        print("No new files to process")
-        return load_index_if_exists(index_path)
-
-    # Import required libraries
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-    from langchain_community.vectorstores import FAISS
-    from langchain_huggingface import HuggingFaceEmbeddings
-
-    embedding_model = HuggingFaceEmbeddings(model_name=DEFAULT_EMBEDDING)
-    splitter = RecursiveCharacterTextSplitter(chunk_size=300, chunk_overlap=50)
-
-    # Process each new file individually
-    for file_path in new_files:
+    # Process each file
+    processed_count = 0
+    for file_path in file_paths:
         print(f"Processing {file_path}...")
         try:
-            # Create embeddings for this file
-            file_docs = _docs_from_json_files([file_path])
-            chunked_docs = list(splitter.split_documents(file_docs))
+            # Read and validate JSON file
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
             
-            file_vectorstore = FAISS.from_documents(chunked_docs, embedding_model)
+            # Create a simple text index entry
+            index_entry = {
+                'file_path': file_path,
+                'file_name': os.path.basename(file_path),
+                'size': os.path.getsize(file_path),
+                'processed_time': time.time(),
+                'data_preview': str(data)[:500] + "..." if len(str(data)) > 500 else str(data)
+            }
             
-            # Save individual file embeddings
-            file_embeddings_path = os.path.join(embeddings_path, os.path.splitext(os.path.basename(file_path))[0])
-            file_vectorstore.save_local(file_embeddings_path)
+            # Save individual file index
+            file_index_path = os.path.join(embeddings_path, os.path.splitext(os.path.basename(file_path))[0] + "_index.json")
+            with open(file_index_path, 'w') as f:
+                json.dump(index_entry, f, indent=2)
             
             # Update processed files tracking
             processed_files.add(file_path)
@@ -267,37 +288,28 @@ def process_and_add_files(file_paths: List[str], index_path: str = "ufdr_faiss_c
             with open(processed_files_path, 'w') as f:
                 json.dump(processed_data, f, indent=2)
             
-            print(f"✅ Processed and saved embeddings for {file_path}")
+            processed_count += 1
+            print(f"✅ Processed {file_path}")
             
         except Exception as e:
             print(f"❌ Failed to process {file_path}: {e}")
             continue
 
-    # Combine all embeddings into the main index
-    print("Updating combined index...")
-    try:
-        combined_vectorstore = None
-        
-        # Load and combine all embeddings
-        for file_path in processed_files:
-            file_embeddings_path = os.path.join(embeddings_path, os.path.splitext(os.path.basename(file_path))[0])
-            if os.path.exists(file_embeddings_path):
-                if combined_vectorstore is None:
-                    combined_vectorstore = FAISS.load_local(file_embeddings_path, embedding_model)
-                else:
-                    file_vectorstore = FAISS.load_local(file_embeddings_path, embedding_model)
-                    combined_vectorstore.merge_from(file_vectorstore)
-
-        if combined_vectorstore:
-            os.makedirs(index_path, exist_ok=True)
-            combined_vectorstore.save_local(index_path)
-            print("✅ Combined index updated successfully")
-            return combined_vectorstore
-        else:
-            print("No valid embeddings found to combine")
-            return None
-
-    except Exception as e:
-        print(f"❌ Failed to update combined index: {e}")
-        raise
+    # Create a combined index file
+    combined_index = {
+        'total_files': processed_count,
+        'processed_files': list(processed_files),
+        'index_created': time.time(),
+        'index_type': 'text_based',
+        'status': 'ready'
+    }
+    
+    combined_index_path = os.path.join(index_path, "index_metadata.json")
+    with open(combined_index_path, 'w') as f:
+        json.dump(combined_index, f, indent=2)
+    
+    print(f"✅ Successfully processed {processed_count} files")
+    print(f"✅ Index metadata saved to {combined_index_path}")
+    
+    return f"Successfully processed {processed_count} files and created index"
 

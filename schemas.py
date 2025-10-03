@@ -27,8 +27,7 @@ class UserOut(BaseModel):
     name: str
     email: EmailStr
 
-    class Config:
-        orm_mode = True
+    model_config = {"from_attributes": True}
 
 
 class QueryRequest(BaseModel):

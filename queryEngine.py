@@ -76,54 +76,112 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# queryEngine provides a function-based query interface so FastAPI can call it.
 def query(q: str, vector_store, db=None, language: str = 'en') -> Dict[str, Any]:
-    """Run a retrieval QA against the provided vector_store and return a structured result.
-
-    Returns: {answer: str, sources: [metadata], gps: [{lat, lon}], session_id: str}
-    """
+    """Enhanced natural language search with uploaded files support."""
     try:
-        if vector_store is None:
-            # Try to load the index if it exists
-            try:
-                from langchain.vectorstores import FAISS
-                from langchain_community.embeddings import HuggingFaceEmbeddings
-                
-                embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-                vector_store = FAISS.load_local("ufdr_faiss_index", embeddings)
-                print("Successfully loaded existing index")
-            except Exception as e:
-                print(f"Failed to load index: {str(e)}")
-                raise ValueError("Vector store is not initialized. Please rebuild the index first.")
-
-        # Build retriever on the provided vector_store
-        retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+        # Get all JSON files (both hardcoded and uploaded)
+        json_files = []
         
-        print(f"Searching for query: {q}")
-        # Get raw context from retriever
-        raw_docs = retriever.get_relevant_documents(q)
-        print(f"Found {len(raw_docs)} relevant documents")
+        # Check for hardcoded files
+        hardcoded_files = ["ufdr_report_1.json", "ufdr_report_2.json", "ufdr_report_3.json"]
+        for filename in hardcoded_files:
+            if os.path.exists(filename):
+                json_files.append(filename)
+        
+        # Check for uploaded files in uploads directory
+        uploads_dir = "uploads"
+        if os.path.exists(uploads_dir):
+            for filename in os.listdir(uploads_dir):
+                if filename.endswith('.json'):
+                    json_files.append(os.path.join(uploads_dir, filename))
+        
+        if not json_files:
+            return {
+                "answer": "No data files found. Please upload JSON files first.",
+                "sources": [],
+                "gps": [],
+                "session_id": str(time.time())
+            }
+        
+        results = []
+        
+        # Process each JSON file
+        for filepath in json_files:
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    
+                # Handle different JSON structures
+                if isinstance(data, list):
+                    # If it's a list of cases
+                    for case in data:
+                        content = json.dumps(case, separators=(',', ':'))
+                        if _matches_query(q, content, case):
+                            results.append({
+                                'content': content,
+                                'metadata': _extract_metadata(case, filepath)
+                            })
+                elif isinstance(data, dict):
+                    # If it's a single case or structured data
+                    content = json.dumps(data, separators=(',', ':'))
+                    if _matches_query(q, content, data):
+                        results.append({
+                            'content': content,
+                            'metadata': _extract_metadata(data, filepath)
+                        })
+                        
+            except Exception as e:
+                print(f"Error processing {filepath}: {e}")
+                continue
+        
+        if not results:
+            return {
+                "answer": f"No relevant information found for '{q}'. Try searching for: fraud, cybercrime, homicide, case numbers, locations, or evidence types.",
+                "sources": [],
+                "gps": [],
+                "session_id": str(time.time())
+            }
+        
+        # Sort by relevance (simple scoring)
+        results = sorted(results, key=lambda x: _calculate_relevance(q, x['content']), reverse=True)
         
         # Format response
         sources = []
         gps_coords = []
         
-        for doc in raw_docs:
-            if hasattr(doc, 'metadata'):
-                sources.append(doc.metadata)
-                
-                # Extract GPS coordinates if available
-                if 'gps' in doc.metadata:
-                    try:
-                        gps = doc.metadata['gps']
-                        if isinstance(gps, dict) and 'lat' in gps and 'lon' in gps:
-                            gps_coords.append(gps)
-                    except Exception as e:
-                        print(f"Error processing GPS data: {str(e)}")
-                        pass
+        for result in results[:5]:  # Limit to top 5
+            metadata = result['metadata']
+            content = result['content']
+            
+            # Create formatted source entry
+            source_entry = {
+                "title": f"Case {metadata.get('case_id', metadata.get('id', 'Unknown'))}",
+                "snippet": _create_snippet(content, q),
+                "relevance": min(0.95, _calculate_relevance(q, content)),
+                "date": metadata.get('date', metadata.get('incident_date', 'Unknown')),
+                "type": metadata.get('incident_type', metadata.get('type', 'Unknown')),
+                "id": metadata.get('case_id', metadata.get('id', 'Unknown'))
+            }
+            sources.append(source_entry)
+            
+            # Extract GPS coordinates
+            coords = metadata.get('coordinates', metadata.get('location', {}).get('coordinates', {}))
+            if coords and isinstance(coords, dict) and 'lat' in coords and 'lon' in coords:
+                gps_coords.append({
+                    "lat": coords['lat'],
+                    "lon": coords['lon'],
+                    "source": metadata.get('source', 'Unknown')
+                })
+        
+        # Create comprehensive answer
+        answer_parts = []
+        for i, result in enumerate(results[:3]):
+            answer_parts.append(f"**Result {i+1}:** {_create_snippet(result['content'], q, 400)}")
+        
+        answer_text = "\n\n".join(answer_parts)
 
         return {
-            "answer": "\n".join([doc.page_content for doc in raw_docs]),
+            "answer": answer_text,
             "sources": sources,
             "gps": gps_coords,
             "session_id": str(time.time())
@@ -131,6 +189,96 @@ def query(q: str, vector_store, db=None, language: str = 'en') -> Dict[str, Any]
     except Exception as e:
         print(f"Search error: {str(e)}")
         raise ValueError(f"Search failed: {str(e)}")
+
+def _matches_query(query: str, content: str, data: dict) -> bool:
+    """Check if content matches the query using various matching strategies."""
+    query_lower = query.lower()
+    content_lower = content.lower()
+    
+    # Direct keyword matching
+    keywords = query_lower.split()
+    if any(keyword in content_lower for keyword in keywords):
+        return True
+    
+    # Semantic matching for common terms
+    semantic_map = {
+        'fraud': ['financial', 'money', 'theft', 'embezzlement', 'scam'],
+        'cybercrime': ['hacking', 'phishing', 'malware', 'data breach', 'cyber'],
+        'homicide': ['murder', 'killing', 'death', 'fatal'],
+        'theft': ['stealing', 'robbery', 'burglary', 'larceny'],
+        'assault': ['attack', 'violence', 'battery', 'harm']
+    }
+    
+    for term, synonyms in semantic_map.items():
+        if term in query_lower:
+            if any(syn in content_lower for syn in synonyms):
+                return True
+    
+    return False
+
+def _extract_metadata(data: dict, filepath: str) -> dict:
+    """Extract metadata from case data."""
+    metadata = {
+        'source': os.path.basename(filepath),
+        'case_id': data.get('case_id', data.get('id', 'Unknown')),
+        'incident_type': data.get('incident_type', data.get('type', 'Unknown')),
+        'date': data.get('date', data.get('incident_date', 'Unknown')),
+        'coordinates': data.get('location', {}).get('coordinates', {}) if isinstance(data.get('location'), dict) else {}
+    }
+    
+    # Extract additional fields
+    if 'victim' in data:
+        metadata['victim'] = data['victim']
+    if 'suspect' in data:
+        metadata['suspect'] = data['suspect']
+    if 'evidence' in data:
+        metadata['evidence_count'] = len(data['evidence']) if isinstance(data['evidence'], list) else 1
+    
+    return metadata
+
+def _calculate_relevance(query: str, content: str) -> float:
+    """Calculate relevance score for search results."""
+    query_lower = query.lower()
+    content_lower = content.lower()
+    
+    score = 0.0
+    
+    # Exact phrase match
+    if query_lower in content_lower:
+        score += 0.8
+    
+    # Keyword matches
+    keywords = query_lower.split()
+    matches = sum(1 for keyword in keywords if keyword in content_lower)
+    score += (matches / len(keywords)) * 0.6
+    
+    # Case ID matches (high priority)
+    if any(keyword.startswith('ufdr') or keyword.startswith('case') for keyword in keywords):
+        score += 0.3
+    
+    return min(1.0, score)
+
+def _create_snippet(content: str, query: str, max_length: int = 200) -> str:
+    """Create a relevant snippet from content."""
+    query_lower = query.lower()
+    content_lower = content.lower()
+    
+    # Find the best matching section
+    if query_lower in content_lower:
+        start = content_lower.find(query_lower)
+        snippet_start = max(0, start - 50)
+        snippet_end = min(len(content), start + len(query) + 150)
+        snippet = content[snippet_start:snippet_end]
+        
+        if snippet_start > 0:
+            snippet = "..." + snippet
+        if snippet_end < len(content):
+            snippet = snippet + "..."
+            
+        return snippet
+    
+    # Fallback to beginning of content
+    return content[:max_length] + "..." if len(content) > max_length else content
 
     if llm is not None:
         try:

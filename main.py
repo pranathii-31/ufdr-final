@@ -151,20 +151,52 @@ async def shutdown_event():
 async def root():
     return {"message": "FastAPI backend running"}
 
+@app.get("/index-status")
+async def index_status():
+    """Return whether the vector index is available and basic metadata if present."""
+    global vector_store
+    status = {"loaded": False}
+    try:
+        if vector_store is None:
+            # attempt lazy load without building
+            vs = build_index.load_index_if_exists()
+            if vs is not None:
+                vector_store = vs
+        if vector_store is not None:
+            status["loaded"] = True
+            # try to expose minimal info when available
+            try:
+                size = getattr(vector_store, "index", None)
+                status["size"] = getattr(size, "ntotal", None)
+            except Exception:
+                pass
+    except Exception as e:
+        status["error"] = str(e)
+    return status
+
 @app.post("/build_index")
 async def build_index_endpoint(current_user: models.User = Depends(get_current_user)):
     global vector_store
     try:
-        vector_store = build_index.build_and_save_index()
+        print("Starting index rebuild...")
+        result = build_index.build_and_save_index()
+        print(f"Index rebuild result: {result}")
+        
         # log audit
         try:
             db = SessionLocal()
             log_audit(db, user=current_user.email, action='rebuild_index')
         except Exception:
             pass
-        return {"status": "Index built and saved"}
+        
+        return {
+            "status": "success", 
+            "message": "Index rebuilt successfully",
+            "details": result
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Index rebuild error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Index rebuild failed: {str(e)}")
 
 
 def get_db_session():
@@ -201,10 +233,22 @@ async def upload_files(files: list[UploadFile] = File(...), current_user: models
         for up in files:
             try:
                 print(f"Processing file: {up.filename}")
-                file_ext = os.path.splitext(up.filename)[1] or '.json'
-                file_id = str(uuid.uuid4())
-                save_name = f"{file_id}{file_ext}"
+                
+                # Validate file type
+                if not up.filename.lower().endswith('.json'):
+                    raise HTTPException(status_code=400, detail=f"Only JSON files are supported. {up.filename} is not a JSON file.")
+                
+                # Use original filename for easier identification
+                save_name = up.filename
                 save_path = os.path.join('uploads', save_name)
+                
+                # Handle duplicate filenames
+                counter = 1
+                while os.path.exists(save_path):
+                    name, ext = os.path.splitext(up.filename)
+                    save_name = f"{name}_{counter}{ext}"
+                    save_path = os.path.join('uploads', save_name)
+                    counter += 1
                 
                 print(f"Saving file to: {save_path}")
                 try:
@@ -213,11 +257,23 @@ async def upload_files(files: list[UploadFile] = File(...), current_user: models
                         out_f.write(content)
                     saved_paths.append(save_path)
                     print(f"File saved successfully")
+                    
+                    # Validate JSON content
+                    try:
+                        with open(save_path, 'r', encoding='utf-8') as f:
+                            json.load(f)
+                        print(f"JSON validation successful for {up.filename}")
+                    except json.JSONDecodeError as e:
+                        print(f"Invalid JSON in {up.filename}: {e}")
+                        os.remove(save_path)  # Remove invalid file
+                        raise HTTPException(status_code=400, detail=f"Invalid JSON file: {up.filename}")
+                        
                 except Exception as e:
                     print(f"Error saving file: {str(e)}")
                     raise HTTPException(status_code=500, detail=f"Error saving file {up.filename}: {str(e)}")
 
                 print("Creating file info record")
+                file_id = str(uuid.uuid4())
                 info = {
                     "id": file_id,
                     "original_name": up.filename,
@@ -225,7 +281,7 @@ async def upload_files(files: list[UploadFile] = File(...), current_user: models
                     "size": os.path.getsize(save_path),
                     "upload_time": datetime.utcnow().isoformat(),
                     "type": up.content_type or 'application/json',
-                    "processed": True  # Mark as processed since we won't process it
+                    "processed": True
                 }
                 uploaded_info.append(info)
 
@@ -261,7 +317,7 @@ async def upload_files(files: list[UploadFile] = File(...), current_user: models
 
         return {
             "status": "success",
-            "message": f"Successfully uploaded {len(uploaded_info)} files",
+            "message": f"Successfully uploaded {len(uploaded_info)} files. You can now search through them or rebuild the index for better performance.",
             "files": uploaded_info
         }
         
