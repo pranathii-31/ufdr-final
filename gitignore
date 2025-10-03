@@ -1,0 +1,30 @@
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment folders
+venv/
+.env/
+
+# VS Code settings folder
+.vscode/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# FAISS or other index folders (can be large, local to machine)
+ufdr_faiss_combined_index/
+ufdr_faiss_index/
+
+# Jupyter notebook checkpoints (if any)
+.ipynb_checkpoints/
+
+# Logs and temp files
+*.log
+*.tmp
+
+# Ignore data files if large or sensitive
+*.json
