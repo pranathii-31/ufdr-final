@@ -41,3 +41,7 @@ class ChatMessage(BaseModel):
     query: str
     answer: str
     sources: Optional[List[Any]] = []
+
+
+class PDFExportRequest(BaseModel):
+    chat_history: List[dict]

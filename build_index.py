@@ -5,7 +5,7 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 import os
 import json
 import time
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import shutil
 
 HARDCODED_FILES = ["ufdr_report_1.json", "ufdr_report_2.json", "ufdr_report_3.json"]
@@ -83,6 +83,241 @@ def extract_metadata(json_data: dict) -> dict:
 
     recursive_extract(json_data)
     return metadata
+
+
+def extract_cross_file_metadata(json_files: List[str]) -> Dict[str, List[dict]]:
+    """Extract metadata that can be used for cross-file analysis.
+    
+    Returns:
+        Dict with keys like 'contacts', 'phones', 'emails', 'devices', etc.
+        Each contains a list of structures with source file info.
+    """
+    cross_metadata = {
+        'contacts': [],
+        'phones': [],
+        'emails': [],
+        'devices': [],
+        'wallets': [],
+        'case_ids': [],
+        'gps_points': []
+    }
+    
+    for file_path in json_files:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            file_basename = os.path.basename(file_path)
+            
+            # Extract contacts
+            contacts = _extract_contacts_from_data(data)
+            for contact in contacts:
+                contact['source_file'] = file_basename
+                cross_metadata['contacts'].append(contact)
+            
+            # Extract phones and emails
+            for contact in contacts:
+                if contact.get('phone'):
+                    cross_metadata['phones'].append({
+                        'phone': contact['phone'],
+                        'name': contact.get('name', ''),
+                        'source_file': file_basename
+                    })
+                if contact.get('email'):
+                    cross_metadata['emails'].append({
+                        'email': contact['email'],
+                        'name': contact.get('name', ''),
+                        'source_file': file_basename
+                    })
+            
+            # Extract device info
+            device_info = _extract_device_info(data)
+            if device_info:
+                device_info['source_file'] = file_basename
+                cross_metadata['devices'].append(device_info)
+            
+            # Extract wallets
+            wallets = _extract_wallets_from_data(data)
+            for wallet in wallets:
+                wallet['source_file'] = file_basename
+                cross_metadata['wallets'].append(wallet)
+            
+            # Extract case IDs
+            case_id = _extract_case_id(data)
+            if case_id:
+                cross_metadata['case_ids'].append({
+                    'case_id': case_id,
+                    'source_file': file_basename
+                })
+            
+            # Extract GPS points
+            gps_points = _extract_gps_from_data(data)
+            for gps in gps_points:
+                gps['source_file'] = file_basename
+                cross_metadata['gps_points'].append(gps)
+                
+        except Exception as e:
+            print(f"Warning: Failed to extract metadata from {file_path}: {e}")
+            continue
+    
+    return cross_metadata
+
+
+def _extract_contacts_from_data(data: dict) -> List[dict]:
+    """Extract contact information from JSON data."""
+    contacts = []
+    
+    def is_contact(obj: dict) -> bool:
+        keys = {k.lower() for k in obj.keys()}
+        return (
+            'name' in keys and ('phone' in keys or 'phonenumber' in keys or 'phone_number' in keys or 'number' in keys or 'email' in keys)
+        ) or ('first_name' in keys or 'last_name' in keys)
+    
+    def normalize(obj: dict) -> dict:
+        name = obj.get('name') or ' '.join(filter(None, [obj.get('first_name'), obj.get('last_name')]))
+        return {
+            'name': str(name or '').strip(),
+            'phone': str(obj.get('phonenumber') or obj.get('phone') or obj.get('phone_number') or obj.get('number') or '').strip(),
+            'email': str(obj.get('email') or obj.get('mail') or '').strip()
+        }
+    
+    def walk(x: Any):
+        if isinstance(x, dict):
+            if is_contact(x):
+                contacts.append(normalize(x))
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                if isinstance(v, dict) and is_contact(v):
+                    contacts.append(normalize(v))
+                walk(v)
+    
+    walk(data)
+    
+    # dedupe by name + phone
+    seen = set()
+    unique_contacts = []
+    for c in contacts:
+        key = (c['name'], c['phone'])
+        if key not in seen and (c['name'] or c['phone'] or c['email']):
+            seen.add(key)
+            unique_contacts.append(c)
+    
+    return unique_contacts
+
+
+def _extract_device_info(data: dict) -> Optional[dict]:
+    """Extract device information from JSON data."""
+    device_info = {}
+    
+    def _find_value(d: Any, keys: List[str]) -> Optional[str]:
+        if not isinstance(d, (dict, list)):
+            return None
+        def walk(x: Any) -> Optional[str]:
+            if isinstance(x, dict):
+                for k in keys:
+                    if k in x and isinstance(x[k], (str, int, float)):
+                        return str(x[k])
+                for v in x.values():
+                    r = walk(v)
+                    if r is not None:
+                        return r
+            elif isinstance(x, list):
+                for item in x:
+                    r = walk(item)
+                    if r is not None:
+                        return r
+            return None
+        return walk(d)
+    
+    device_info['device_model'] = _find_value(data, ["device_model", "model", "device", "devicename"])
+    device_info['imei'] = _find_value(data, ["imei", "IMEI"])
+    device_info['serial'] = _find_value(data, ["serial", "serialnumber", "serial_number", "serialNumber"])
+    device_info['os_version'] = _find_value(data, ["os_version", "osversion", "os", "android_version", "ios_version"])
+    
+    return device_info if any(device_info.values()) else None
+
+
+def _extract_wallets_from_data(data: dict) -> List[dict]:
+    """Extract wallet information from JSON data."""
+    wallets = []
+    
+    def walk(x: Any):
+        if isinstance(x, dict):
+            # Check if this looks like a wallet object
+            keys = {k.lower() for k in x.keys()}
+            if any(word in keys for word in ['wallet', 'address', 'addresses', 'balance', 'amount']):
+                wallet_info = {
+                    'address': x.get('address') or x.get('wallet') or x.get('addresses'),
+                    'balance': x.get('balance') or x.get('amount') or x.get('total'),
+                    'type': x.get('type') or x.get('wallet_type')
+                }
+                if wallet_info['address']:
+                    wallets.append(wallet_info)
+            
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                if isinstance(v, dict):
+                    walk(v)
+    
+    walk(data)
+    return wallets
+
+
+def _extract_case_id(data: dict) -> Optional[str]:
+    """Extract case ID from JSON data."""
+    def _find_value(d: Any, keys: List[str]) -> Optional[str]:
+        if not isinstance(d, (dict, list)):
+            return None
+        def walk(x: Any) -> Optional[str]:
+            if isinstance(x, dict):
+                for k in keys:
+                    if k in x and isinstance(x[k], (str, int, float)):
+                        return str(x[k])
+                for v in x.values():
+                    r = walk(v)
+                    if r is not None:
+                        return r
+            elif isinstance(x, list):
+                for item in x:
+                    r = walk(item)
+                    if r is not None:
+                        return r
+            return None
+        return walk(d)
+    
+    return _find_value(data, ["case_id", "caseid", "caseId", "caseID"])
+
+
+def _extract_gps_from_data(data: dict) -> List[dict]:
+    """Extract GPS coordinates from JSON data."""
+    gps_points = []
+    
+    def walk(x: Any):
+        if isinstance(x, dict):
+            if set(x.keys()) >= {"lat", "lon"} or set(x.keys()) >= {"latitude", "longitude"}:
+                try:
+                    lat_key = "lat" if "lat" in x else "latitude"
+                    lon_key = "lon" if "lon" in x else "longitude"
+                    gps_points.append({
+                        "lat": float(x[lat_key]), 
+                        "lon": float(x[lon_key]),
+                        "timestamp": x.get('timestamp', ''),
+                        "address": x.get('address', '')
+                    })
+                except Exception:
+                    pass
+            for v in x.values():
+                walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    
+    walk(data)
+    return gps_points
 
 
 DEFAULT_EMBEDDING = "sentence-transformers/all-MiniLM-L6-v2"
@@ -237,7 +472,7 @@ def load_index_if_exists(index_path: str = "ufdr_faiss_combined_index"):
 
 
 def process_and_add_files(file_paths: List[str], index_path: str = "ufdr_faiss_combined_index", embeddings_path: str = "embeddings"):
-    """Process a list of JSON file paths and create a simple text-based index.
+    """Process a list of JSON file paths and create a simple text-based index with cross-file metadata.
     
     Args:
         file_paths: List of JSON files to process
@@ -245,7 +480,7 @@ def process_and_add_files(file_paths: List[str], index_path: str = "ufdr_faiss_c
         embeddings_path: Directory to store individual file data
     
     Returns:
-        Success message indicating files were processed.
+        combined_index structure for enhanced query capabilities
     """
     print(f"Processing {len(file_paths)} files for indexing...")
     
@@ -263,8 +498,14 @@ def process_and_add_files(file_paths: List[str], index_path: str = "ufdr_faiss_c
         processed_data = {'processed_files': [], 'uploaded_files_info': []}
         processed_files = set()
 
+    # Extract cross-file metadata for enhanced queries
+    print("Extracting cross-file metadata...")
+    cross_metadata = extract_cross_file_metadata(file_paths)
+    
     # Process each file
     processed_count = 0
+    file_details = {}
+    
     for file_path in file_paths:
         print(f"Processing {file_path}...")
         try:
@@ -272,17 +513,24 @@ def process_and_add_files(file_paths: List[str], index_path: str = "ufdr_faiss_c
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             
-            # Create a simple text index entry
+            file_basename = os.path.basename(file_path)
+            
+            # Create enhanced index entry with cross-file capabilities
             index_entry = {
                 'file_path': file_path,
-                'file_name': os.path.basename(file_path),
+                'file_name': file_basename,
                 'size': os.path.getsize(file_path),
                 'processed_time': time.time(),
-                'data_preview': str(data)[:500] + "..." if len(str(data)) > 500 else str(data)
+                'data_preview': str(data)[:500] + "..." if len(str(data)) > 500 else str(data),
+                'contacts_count': len([c for c in cross_metadata['contacts'] if c.get('source_file') == file_basename]),
+                'device_info': next((d for d in cross_metadata['devices'] if d.get('source_file') == file_basename), {}),
+                'case_id': next((c['case_id'] for c in cross_metadata['case_ids'] if c.get('source_file') == file_basename), None)
             }
             
+            file_details[file_basename] = index_entry
+            
             # Save individual file index
-            file_index_path = os.path.join(embeddings_path, os.path.splitext(os.path.basename(file_path))[0] + "_index.json")
+            file_index_path = os.path.join(embeddings_path, os.path.splitext(file_basename)[0] + "_index.json")
             with open(file_index_path, 'w') as f:
                 json.dump(index_entry, f, indent=2)
             
@@ -299,21 +547,41 @@ def process_and_add_files(file_paths: List[str], index_path: str = "ufdr_faiss_c
             print(f"❌ Failed to process {file_path}: {e}")
             continue
 
-    # Create a combined index file
+    # Create enhanced combined index file with cross-file analysis capabilities
     combined_index = {
         'total_files': processed_count,
         'processed_files': list(processed_files),
         'index_created': time.time(),
-        'index_type': 'text_based',
-        'status': 'ready'
+        'index_type': 'text_based_with_cross_file',
+        'status': 'ready',
+        'file_details': file_details,
+        'cross_file_metadata': cross_metadata,
+        'analysis_summary': {
+            'total_contacts': len(cross_metadata['contacts']),
+            'unique_phones': len(set(c['phone'] for c in cross_metadata['phones'] if c['phone'])),
+            'unique_emails': len(set(c['email'] for c in cross_metadata['emails'] if c['email'])),
+            'total_devices': len(cross_metadata['devices']),
+            'total_wallets': len(cross_metadata['wallets']),
+            'gps_locations': len(cross_metadata['gps_points']),
+            'case_ids': list(set(c['case_id'] for c in cross_metadata['case_ids'] if c['case_id']))
+        }
     }
     
     combined_index_path = os.path.join(index_path, "index_metadata.json")
     with open(combined_index_path, 'w') as f:
         json.dump(combined_index, f, indent=2)
     
+    # Save cross-file analysis separately for easy access
+    cross_analysis_path = os.path.join(index_path, "cross_file_analysis.json")
+    with open(cross_analysis_path, 'w') as f:
+        json.dump(cross_metadata, f, indent=2)
+    
     print(f"✅ Successfully processed {processed_count} files")
     print(f"✅ Index metadata saved to {combined_index_path}")
+    print(f"✅ Cross-file analysis saved to {cross_analysis_path}")
+    print(f"📊 Found {combined_index['analysis_summary']['total_contacts']} contacts across {processed_count} files")
+    print(f"📱 Found {combined_index['analysis_summary']['unique_phones']} unique phone numbers")
+    print(f"📧 Found {combined_index['analysis_summary']['unique_emails']} unique email addresses")
     
-    return f"Successfully processed {processed_count} files and created index"
+    return combined_index
 

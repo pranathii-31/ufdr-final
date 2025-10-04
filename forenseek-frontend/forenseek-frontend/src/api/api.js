@@ -175,11 +175,12 @@ export async function getAuditLogs(page = 1, pageSize = 50) {
   return await response.json();
 }
 
-// Export PDF
-export async function exportPDF(sessionId) {
-  const response = await fetch(`${API_BASE}/export-pdf/${sessionId}`, {
-    method: 'GET',
-    headers: { ...getAuthHeader() },
+// Export PDF with full chat history
+export async function exportPDF(chatHistory) {
+  const response = await fetch(`${API_BASE}/export-pdf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+    body: JSON.stringify({ chat_history: chatHistory })
   });
   if (!response.ok) {
     throw new Error('Failed to export PDF');

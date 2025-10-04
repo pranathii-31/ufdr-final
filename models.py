@@ -44,7 +44,16 @@ class ChatEntry(Base):
 class AuditLog(Base):
     __tablename__ = 'audit_logs'
     id = Column(Integer, primary_key=True, index=True)
-    user = Column(String)
-    action = Column(String)
-    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+    user = Column(String, nullable=False, index=True)
+    action = Column(String, nullable=False, index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
     extra = Column(JSON)
+    ip_address = Column(String(45), index=True)  # IPv6 support
+    user_agent = Column(Text)
+    session_id = Column(String(255), index=True)
+    resource_affected = Column(String(255), index=True)  # file, case_id, etc.
+    outcome = Column(String(50), index=True)  # success, failure, error
+    severity = Column(String(20), default='medium', index=True)  # low, medium, high, critical
+    risk_score = Column(Integer, default=0, index=True)  # 0-100 risk assessment
+    geo_location = Column(String(255))  # Country/city if IP geolocation available
+    duration_ms = Column(Integer)  # Time taken for action

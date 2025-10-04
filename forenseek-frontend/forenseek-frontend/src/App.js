@@ -6,6 +6,7 @@ import {
   exportPDF, getAnalytics, saveChatMessage, getAuditLogs 
 } from './api/api';
 import ChatHistory from './components/ChatHistory';
+import AuditLogsView from './components/AuditLogsView';
 import { useLanguage } from './context/LanguageContext';
 
 
@@ -35,6 +36,7 @@ const ForenseekApp = () => {
   const [assistantText, setAssistantText] = useState('');
   const [analyticsData, setAnalyticsData] = useState(null);
   const [latestSessionId, setLatestSessionId] = useState(null);
+  const [allChatHistory, setAllChatHistory] = useState([]);
 
   const handleLogin = async (e) => {
     e.preventDefault();
@@ -117,6 +119,7 @@ const ForenseekApp = () => {
       ];
       
       setChatMessages(prev => ([...prev, ...newChat]));
+      setAllChatHistory(prev => ([...prev, ...newChat]));
       
       // persist chat to backend
       try {
@@ -239,16 +242,17 @@ const ForenseekApp = () => {
 
   const handleExportPDF = async () => {
     if (!user) { alert('Please login first'); return; }
-    // open PDF via API for current session (last chat)
-    const lastSession = latestSessionId || (chatMessages.length ? chatMessages[chatMessages.length-1].session_id : null);
-    if (!lastSession) {
-      alert('No session available to export');
+    
+    if (allChatHistory.length === 0) {
+      alert('No chat history available to export');
       return;
     }
+    
     try {
-      const blob = await exportPDF(lastSession);
-      downloadBlob(blob, `session_${lastSession}.pdf`);
-      setNotifications(prev => [{ id: Date.now(), message: `PDF exported for session ${lastSession}`, time: 'now', read: false }, ...prev]);
+      const blob = await exportPDF(allChatHistory);
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      downloadBlob(blob, `complete_chat_history_${timestamp}.pdf`);
+      setNotifications(prev => [{ id: Date.now(), message: `PDF exported with complete chat history`, time: 'now', read: false }, ...prev]);
     } catch (err) {
       alert('PDF export failed');
     }
@@ -548,11 +552,52 @@ const ForenseekApp = () => {
                 </form>
               </div>
 
-              {/* Assistant answer */}
-              {assistantText && (
+              {/* Chat History */}
+              {allChatHistory.length > 0 && (
                 <div className="bg-white rounded-lg shadow-md p-6">
-                  <h2 className="text-xl font-bold text-gray-900 mb-2">Assistant</h2>
-                  <p className="whitespace-pre-line text-gray-800">{assistantText}</p>
+                  <div className="flex items-center justify-between mb-4">
+                    <h2 className="text-xl font-bold text-gray-900">Conversation History</h2>
+                    <button
+                      onClick={() => {
+                        setAllChatHistory([]);
+                        setAssistantText('');
+                        setSearchResults([]);
+                      }}
+                      className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition text-sm"
+                    >
+                      Clear History
+                    </button>
+                  </div>
+                  <div className="space-y-4 max-h-96 overflow-y-auto">
+                    {allChatHistory.map((message, index) => (
+                      <div
+                        key={index}
+                        className={`flex ${message.type === 'user' ? 'justify-end' : 'justify-start'}`}
+                      >
+                        <div
+                          className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
+                            message.type === 'user'
+                              ? 'bg-blue-600 text-white'
+                              : 'bg-gray-100 text-gray-800'
+                          }`}
+                        >
+                          <div className="font-medium text-sm mb-1">
+                            {message.type === 'user' ? 'You' : 'Assistant'}
+                          </div>
+                          <div className="whitespace-pre-line text-sm">
+                            {message.text}
+                          </div>
+                          {message.results && message.results.length > 0 && (
+                            <div className="mt-2 pt-2 border-t border-gray-300">
+                              <div className="text-xs text-gray-600">
+                                Found {message.results.length} relevant sources
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -651,37 +696,7 @@ const ForenseekApp = () => {
           )}
 
           {activeView === 'audit' && (
-            <div className="bg-white rounded-lg shadow-md p-6">
-              <h2 className="text-2xl font-bold text-gray-900 mb-6">{t.auditLogs}</h2>
-              <div className="space-y-3">
-                {[
-                  { user: 'John Doe', action: 'Searched for "financial fraud"', timestamp: '2024-10-01 14:32:15', ip: '192.168.1.100' },
-                  { user: 'Jane Smith', action: 'Exported case #2024-045', timestamp: '2024-10-01 14:28:42', ip: '192.168.1.101' },
-                  { user: 'Admin', action: 'Rebuilt search index', timestamp: '2024-10-01 13:15:00', ip: '192.168.1.1' },
-                  { user: 'John Doe', action: 'Uploaded document: evidence_log.pdf', timestamp: '2024-10-01 12:45:33', ip: '192.168.1.100' },
-                  { user: 'Mike Johnson', action: 'Modified case #2024-043', timestamp: '2024-10-01 11:20:18', ip: '192.168.1.102' },
-                ].map((log, idx) => (
-                  <div key={idx} className="p-4 border border-gray-200 rounded-lg hover:bg-gray-50 transition">
-                    <div className="flex items-center justify-between">
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2 mb-1">
-                          <User className="w-4 h-4 text-gray-500" />
-                          <span className="font-medium text-gray-900">{log.user}</span>
-                        </div>
-                        <p className="text-sm text-gray-700">{log.action}</p>
-                        <div className="flex items-center gap-4 mt-2 text-xs text-gray-500">
-                          <span className="flex items-center gap-1">
-                            <Clock className="w-3 h-3" />
-                            {log.timestamp}
-                          </span>
-                          <span>IP: {log.ip}</span>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
+            <AuditLogsView currentUser={user} />
           )}
 
           {activeView === 'profile' && (

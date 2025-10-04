@@ -118,14 +118,31 @@ def _load_json_safely(filepath: str):
             raise ValueError(f"Unable to parse JSON file '{os.path.basename(filepath)}': {e}")
 
 def query(q: str, vector_store, db=None, language: str = 'en') -> Dict[str, Any]:
-    """Enhanced natural language search focused on the most recently uploaded file.
+    """Enhanced natural language search with multi-file and cross-file analysis capabilities.
 
     Strategy:
-    - Prefer the newest JSON file in uploads/ (single-file focus)
-    - Fall back to hardcoded ufdr_report_*.json if uploads is empty
-    - Answer domain questions with rule-based extractors (case/device/owner/wallets/contacts)
+    - Detect if query requires cross-file analysis (e.g., "compare files", "common contacts")
+    - For single-file queries: use existing logic focused on most recent file
+    - For cross-file queries: analyze relationships between multiple files
+    - Support queries like:
+      * "Find common contacts between all files"
+      * "Compare device information across files"
+      * "What's the relationship between file1.json and file2.json?"
+      * "Show me all unique phone numbers across all files"
     """
     try:
+        # Detect if this is a cross-file query
+        q_lower = q.lower()
+        is_cross_file_query = any(phrase in q_lower for phrase in [
+            'common', 'compare', 'across', 'between', 'all files', 
+            'relationship', 'shared', 'both files', 'multiple files',
+            'intersection', 'difference', 'unique across'
+        ])
+        
+        if is_cross_file_query:
+            return _handle_cross_file_query(q, language)
+        
+        # Single-file queries (existing logic)
         target_path = _pick_target_file()
         if not target_path:
             return {
@@ -149,6 +166,501 @@ def query(q: str, vector_store, db=None, language: str = 'en') -> Dict[str, Any]
     except Exception as e:
         print(f"Search error: {str(e)}")
         raise ValueError(f"Search failed: {str(e)}")
+
+
+def _handle_cross_file_query(q: str, language: str = 'en') -> Dict[str, Any]:
+    """Handle queries that require analysis across multiple files."""
+    try:
+        # Load cross-file metadata
+        cross_file_data = _load_cross_file_metadata()
+        if not cross_file_data:
+            return {
+                "answer": "No multiple files found for cross-file analysis. Please upload at least 2 JSON files.",
+                "sources": [],
+                "gps": [],
+                "session_id": str(time.time())
+            }
+        
+        # Parse the query and perform cross-file analysis
+        query_type = _detect_cross_file_query_type(q)
+        result = _perform_cross_file_analysis(query_type, cross_file_data, q)
+        
+        return {
+            "answer": result.get('answer', 'Cross-file analysis completed'),
+            "sources": result.get('sources', []),
+            "gps": result.get('gps', []),
+            "session_id": str(time.time()),
+            "analysis_type": query_type,
+            "comparison_data": result.get('comparison_data', [])
+        }
+    except Exception as e:
+        print(f"Cross-file query error: {str(e)}")
+        return {
+            "answer": f"Cross-file analysis failed: {str(e)}",
+            "sources": [],
+            "gps": [],
+            "session_id": str(time.time())
+        }
+
+
+def _detect_cross_file_query_type(q: str) -> str:
+    """Detect the type of cross-file query being asked."""
+    q_lower = q.lower()
+    
+    if any(word in q_lower for word in ['contact', 'contacts']):
+        return 'contacts'
+    elif any(word in q_lower for word in ['phone', 'phones', 'number', 'numbers']):
+        return 'phones'
+    elif any(word in q_lower for word in ['email', 'emails', 'mail']):
+        return 'emails'
+    elif any(word in q_lower for word in ['device', 'devices', 'imei', 'model']):
+        return 'devices'
+    elif any(word in q_lower for word in ['wallet', 'wallets', 'address', 'balance']):
+        return 'wallets'
+    elif any(word in q_lower for word in ['location', 'gps', 'coordinate', 'coordinates']):
+        return 'locations'
+    elif any(word in q_lower for word in ['case', 'case_id', 'caseid']):
+        return 'cases'
+    else:
+        return 'general'
+
+
+def _load_cross_file_metadata() -> Optional[Dict]:
+    """Load cross-file metadata from the index."""
+    try:
+        # Try the new cross-file analysis file first
+        cross_analysis_paths = [
+            "ufdr_faiss_combined_index/cross_file_analysis.json",
+            "embeddings/cross_file_analysis.json", 
+            "cross_file_analysis.json"
+        ]
+        
+        for path in cross_analysis_paths:
+            if os.path.exists(path):
+                with open(path, 'r') as f:
+                    return json.load(f)
+        
+        # Fallback to generating metadata from available files
+        available_files = _get_all_json_files()
+        if len(available_files) >= 2:
+            from build_index import extract_cross_file_metadata
+            return extract_cross_file_metadata(available_files)
+        
+        return None
+    except Exception as e:
+        print(f"Failed to load cross-file metadata: {e}")
+        return None
+
+
+def _get_all_json_files() -> List[str]:
+    """Get all available JSON files (uploads + hardcoded)."""
+    files = []
+    
+    # Add hardcoded files
+    hardcoded_files = ["ufdr_report_1.json", "ufdr_report_2.json", "ufdr_report_3.json"]
+    for filename in hardcoded_files:
+        if os.path.exists(filename):
+            files.append(filename)
+    
+    # Add uploaded files
+    uploads_dir = "uploads"
+    if os.path.exists(uploads_dir):
+        for filename in os.listdir(uploads_dir):
+            if filename.endswith('.json'):
+                files.append(os.path.join(uploads_dir, filename))
+    
+    # Add any other JSON files in the directory
+    for filename in os.listdir('.'):
+        if filename.endswith('.json') and filename not in hardcoded_files:
+            files.append(filename)
+    
+    return files
+
+
+def _perform_cross_file_analysis(query_type: str, cross_file_data: Dict, query: str) -> Dict:
+    """Perform cross-file analysis based on query type."""
+    result = {
+        "answer": "",
+        "sources": [],
+        "gps": [],
+        "comparison_data": []
+    }
+    
+    if query_type == 'contacts':
+        result = _analyze_contacts_cross_file(cross_file_data, query)
+    elif query_type == 'phones':
+        result = _analyze_phones_cross_file(cross_file_data, query)
+    elif query_type == 'emails':
+        result = _analyze_emails_cross_file(cross_file_data, query)
+    elif query_type == 'devices':
+        result = _analyze_devices_cross_file(cross_file_data, query)
+    elif query_type == 'wallets':
+        result = _analyze_wallets_cross_file(cross_file_data, query)
+    elif query_type == 'locations':
+        result = _analyze_locations_cross_file(cross_file_data, query)
+    elif query_type == 'cases':
+        result = _analyze_cases_cross_file(cross_file_data, query)
+    else:
+        result = _analyze_general_cross_file(cross_file_data, query)
+    
+    return result
+
+
+def _analyze_contacts_cross_file(cross_file_data: Dict, query: str) -> Dict:
+    """Analyze contacts across multiple files."""
+    contacts = cross_file_data.get('contacts', [])
+    if not contacts:
+        return {
+            "answer": "No contacts found across all files.",
+            "sources": [],
+            "gps": [],
+            "comparison_data": []
+        }
+    
+    # Group contacts by file
+    contacts_by_file = {}
+    for contact in contacts:
+        source_file = contact.get('source_file', 'Unknown')
+        if source_file not in contacts_by_file:
+            contacts_by_file[source_file] = []
+        contacts_by_file[source_file].append(contact)
+    
+    # Find common contacts (same name or phone)
+    common_contacts = _find_common_contacts(contacts)
+    
+    # Build response
+    answer_parts = [
+        f"📞 **Contact Analysis Across {len(contacts_by_file)} Files:**\n\n"
+    ]
+    
+    # Summary by file
+    for file_name, file_contacts in contacts_by_file.items():
+        answer_parts.append(f"**{file_name}**: {len(file_contacts)} contacts")
+    
+    answer_parts.append(f"\n**Total**: {len(contacts)} contacts")
+    answer_parts.append(f"**Unique Names**: {len(set(c.get('name', '') for c in contacts if c.get('name')))}")
+    answer_parts.append(f"**Unique Phones**: {len(set(c.get('phone', '') for c in contacts if c.get('phone')))}")
+    
+    if common_contacts:
+        answer_parts.append(f"\n🔍 **Common Contacts Found**: {len(common_contacts)}")
+        for common in common_contacts[:5]:  # Show first 5
+            sources = ", ".join(common['source_files'])
+            name = common['name'] or "Unknown"
+            phone = common['phone'] or "No phone"
+            answer_parts.append(f"- **{name}** ({phone}) in: {sources}")
+    
+    result = {
+        "answer": "\n".join(answer_parts),
+        "sources": [_contact_to_source_card(contacts_by_file)],
+        "gps": [],
+        "comparison_data": {
+            "contacts_by_file": contacts_by_file,
+            "common_contacts": common_contacts,
+            "statistics": {
+                "total_contacts": len(contacts),
+                "unique_names": len(set(c.get('name', '') for c in contacts if c.get('name'))),
+                "unique_phones": len(set(c.get('phone', '') for c in contacts if c.get('phone'))),
+                "files_with_contacts": len(contacts_by_file)
+            }
+        }
+    }
+    
+    return result
+
+
+def _find_common_contacts(contacts: List[Dict]) -> List[Dict]:
+    """Find contacts that appear in multiple files."""
+    # Group by normalized name and phone
+    contact_groups = {}
+    
+    for contact in contacts:
+        name = contact.get('name', '').strip().lower()
+        phone = contact.get('phone', '').strip()
+        
+        # Create a normalized key
+        key = f"{name}|{phone}"
+        
+        if key not in contact_groups:
+            contact_groups[key] = {
+                'name': contact.get('name', ''),
+                'phone': phone,
+                'email': contact.get('email', ''),
+                'source_files': []
+            }
+        
+        contact_groups[key]['source_files'].append(contact.get('source_file', 'Unknown'))
+    
+    # Filter to only those that appear in multiple files
+    common_contacts = []
+    for contact_info in contact_groups.values():
+        if len(contact_info['source_files']) > 1:
+            common_contacts.append(contact_info)
+    
+    return common_contacts
+
+
+def _analyze_phones_cross_file(cross_file_data: Dict, query: str) -> Dict:
+    """Analyze phone numbers across multiple files."""
+    phones = cross_file_data.get('phones', [])
+    if not phones:
+        return {
+            "answer": "No phone numbers found across all files.",
+            "sources": [],
+            "gps": [],
+            "comparison_data": []
+        }
+    
+    # Group phones by file
+    phones_by_file = {}
+    for phone_data in phones:
+        source_file = phone_data.get('source_file', 'Unknown')
+        if source_file not in phones_by_file:
+            phones_by_file[source_file] = []
+        phones_by_file[source_file].append(phone_data)
+    
+    # Find unique phones
+    unique_phones = set(p['phone'] for p in phones if p['phone'])
+    
+    # Find phones that appear in multiple files
+    common_phones = []
+    for phone_num in unique_phones:
+        files_with_phone = [p['source_file'] for p in phones if p['phone'] == phone_num]
+        names_with_phone = [p['name'] for p in phones if p['phone'] == phone_num and p['name']]
+        
+        if len(set(files_with_phone)) > 1:  # Appears in more than one file
+            common_phones.append({
+                'phone': phone_num,
+                'names': list(set(names_with_phone)),
+                'files': list(set(files_with_phone))
+            })
+    
+    answer_parts = [
+        f"📱 **Phone Number Analysis Across {len(phones_by_file)} Files:**\n\n"
+    ]
+    
+    for file_name, file_phones in phones_by_file.items():
+        answer_parts.append(f"**{file_name}**: {len(file_phones)} phone numbers")
+    
+    answer_parts.append(f"\n**Total**: {len(phones)} phone records")
+    answer_parts.append(f"**Unique Numbers**: {len(unique_phones)}")
+    
+    if common_phones:
+        answer_parts.append(f"\n🔥 **Shared Phone Numbers**: {len(common_phones)}")
+        for common in common_phones[:5]:
+            names = ", ".join(common['names']) if common['names'] else "Unknown"
+            files = ", ".join(common['files'])
+            answer_parts.append(f"- **{common['phone']}** ({names}) in: {files}")
+    
+    return {
+        "answer": "\n".join(answer_parts),
+        "sources": [_phones_to_source_card(phones_by_file)],
+        "gps": [],
+        "comparison_data": {
+            "phones_by_file": phones_by_file,
+            "common_phones": common_phones,
+            "unique_phones": list(unique_phones)
+        }
+    }
+
+
+def _analyze_emails_cross_file(cross_file_data: Dict, query: str) -> Dict:
+    """Analyze email addresses across multiple files."""
+    emails = cross_file_data.get('emails', [])
+    
+    answer_parts = [f"📧 **Email Analysis:** Found {len(emails)} email records"]
+    
+    if emails:
+        unique_emails = set(e['email'] for e in emails if e['email'])
+        answer_parts.append(f"**Unique emails**: {len(unique_emails)}")
+        
+        # Group by file
+        emails_by_file = {}
+        for email_data in emails:
+            source_file = email_data.get('source_file', 'Unknown')
+            if source_file not in emails_by_file:
+                emails_by_file[source_file] = []
+            emails_by_file[source_file].append(email_data)
+        
+        for file_name, file_emails in emails_by_file.items():
+            answer_parts.append(f"**{file_name}**: {len(file_emails)} emails")
+    
+    return {
+        "answer": "\n".join(answer_parts),
+        "sources": [],
+        "gps": [],
+        "comparison_data": {}
+    }
+
+
+def _analyze_devices_cross_file(cross_file_data: Dict, query: str) -> Dict:
+    """Analyze device information across multiple files."""
+    devices = cross_file_data.get('devices', [])
+    
+    answer_parts = [f"📱 **Device Analysis:** Found {len(devices)} devices"]
+    
+    if devices:
+        models = set()
+        imeis = set()
+        
+        for device in devices:
+            if device.get('device_model'):
+                models.add(device['device_model'])
+            if device.get('imei'):
+                imeis.add(device['imei'])
+        
+        answer_parts.append(f"**Unique Models**: {len(models)}")
+        answer_parts.append(f"**Unique IMEIs**: {len(imeis)}")
+        
+        # Show device details
+        for device in devices:
+            source_file = device.get('source_file', 'Unknown')
+            model = device.get('device_model', 'Unknown')
+            imei = device.get('imei', 'Unknown')
+            answer_parts.append(f"- **{source_file}**: {model} (IMEI: {imei})")
+    
+    return {
+        "answer": "\n".join(answer_parts),
+        "sources": [],
+        "gps": [],
+        "comparison_data": {}
+    }
+
+
+def _analyze_wallets_cross_file(cross_file_data: Dict, query: str) -> Dict:
+    """Analyze wallet addresses across multiple files."""
+    wallets = cross_file_data.get('wallets', [])
+    
+    answer_parts = [f"💰 **Wallet Analysis:** Found {len(wallets)} wallet addresses"]
+    
+    if wallets:
+        unique_addresses = set(w['address'] for w in wallets if w.get('address'))
+        answer_parts.append(f"**Unique Addresses**: {len(unique_addresses)}")
+        
+        # Group by file
+        wallets_by_file = {}
+        for wallet in wallets:
+            source_file = wallet.get('source_file', 'Unknown')
+            if source_file not in wallets_by_file:
+                wallets_by_file[source_file] = []
+            wallets_by_file[source_file].append(wallet)
+        
+        for file_name, file_wallets in wallets_by_file.items():
+            answer_parts.append(f"**{file_name}**: {len(file_wallets)} wallets")
+    
+    return {
+        "answer": "\n".join(answer_parts),
+        "sources": [],
+        "gps": [],
+        "comparison_data": {}
+    }
+
+
+def _analyze_locations_cross_file(cross_file_data: Dict, query: str) -> Dict:
+    """Analyze GPS locations across multiple files."""
+    gps_points = cross_file_data.get('gps_points', [])
+    
+    answer_parts = [f"📍 **Location Analysis:** Found {len(gps_points)} GPS coordinates"]
+    
+    if gps_points:
+        # Group by file
+        locations_by_file = {}
+        all_gps = []
+        
+        for gps in gps_points:
+            source_file = gps.get('source_file', 'Unknown')
+            if source_file not in locations_by_file:
+                locations_by_file[source_file] = []
+            locations_by_file[source_file].append(gps)
+            all_gps.append(gps)
+        
+        for file_name, file_gps in locations_by_file.items():
+            answer_parts.append(f"**{file_name}**: {len(file_gps)} locations")
+        
+        result = {
+            "answer": "\n".join(answer_parts),
+            "sources": [],
+            "gps": all_gps,
+            "comparison_data": {"locations_by_file": locations_by_file}
+        }
+    else:
+        result = {
+            "answer": "\n".join(answer_parts),
+            "sources": [],
+            "gps": [],
+            "comparison_data": {}
+        }
+    
+    return result
+
+
+def _analyze_cases_cross_file(cross_file_data: Dict, query: str) -> Dict:
+    """Analyze case IDs across multiple files."""
+    case_ids = cross_file_data.get('case_ids', [])
+    
+    answer_parts = [f"🔍 **Case Analysis:** Found {len(case_ids)} case records"]
+    
+    if case_ids:
+        unique_cases = set(c['case_id'] for c in case_ids if c['case_id'])
+        answer_parts.append(f"**Unique Case IDs**: {len(unique_cases)}")
+        
+        for case_info in case_ids:
+            source_file = case_info.get('source_file', 'Unknown')
+            case_id = case_info.get('case_id', 'Unknown')
+            answer_parts.append(f"- **{source_file}**: Case {case_id}")
+    
+    return {
+        "answer": "\n".join(answer_parts),
+        "sources": [],
+        "gps": [],
+        "comparison_data": {}
+    }
+
+
+def _analyze_general_cross_file(cross_file_data: Dict, query: str) -> Dict:
+    """General cross-file analysis."""
+    summary = []
+    
+    total_contacts = len(cross_file_data.get('contacts', []))
+    total_phones = len(cross_file_data.get('phones', []))
+    total_emails = len(cross_file_data.get('emails', []))
+    total_devices = len(cross_file_data.get('devices', []))
+    
+    summary.append("📊 **Cross-File Summary:**")
+    summary.append(f"- Contacts: {total_contacts}")
+    summary.append(f"- Phone Numbers: {total_phones}")
+    summary.append(f"- Email Addresses: {total_emails}")
+    summary.append(f"- Devices: {total_devices}")
+    
+    return {
+        "answer": "\n".join(summary),
+        "sources": [],
+        "gps": [],
+        "comparison_data": cross_file_data
+    }
+
+
+def _contact_to_source_card(contacts_by_file):
+    """Create a source card for contact analysis."""
+    return {
+        "id": "cross_file_contacts",
+        "title": "Cross-File Contact Analysis",
+        "snippet": f"Analyzed contacts across {len(contacts_by_file)} files",
+        "relevance": 1.0,
+        "date": "",
+        "type": "Cross-File Analysis"
+    }
+
+
+def _phones_to_source_card(phones_by_file):
+    """Create a source card for phone analysis."""
+    return {
+        "id": "cross_file_phones", 
+        "title": "Cross-File Phone Analysis",
+        "snippet": f"Analyzed phone numbers across {len(phones_by_file)} files",
+        "relevance": 1.0,
+        "date": "",
+        "type": "Cross-File Analysis"
+    }
 
 # ------------------- Target file selection -------------------
 def _pick_target_file() -> Optional[str]:
