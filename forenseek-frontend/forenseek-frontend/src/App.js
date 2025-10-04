@@ -7,6 +7,7 @@ import {
 } from './api/api';
 import ChatHistory from './components/ChatHistory';
 import AuditLogsView from './components/AuditLogsView';
+import ShareModal from './components/ShareModal';
 import { useLanguage } from './context/LanguageContext';
 
 
@@ -249,16 +250,27 @@ const ForenseekApp = () => {
     }
     
     try {
+      console.log('Starting PDF export with chat history:', allChatHistory.length, 'messages');
       const blob = await exportPDF(allChatHistory);
+      console.log('PDF blob received, size:', blob.size);
+      
+      if (blob.size === 0) {
+        throw new Error('Empty PDF generated');
+      }
+      
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
       downloadBlob(blob, `complete_chat_history_${timestamp}.pdf`);
       setNotifications(prev => [{ id: Date.now(), message: `PDF exported with complete chat history`, time: 'now', read: false }, ...prev]);
     } catch (err) {
-      alert('PDF export failed');
+      console.error('PDF export error:', err);
+      alert(`PDF export failed: ${err.message}`);
     }
   };
 
   const [auditLogs, setAuditLogs] = useState([]);
+  const [showShareModal, setShowShareModal] = useState(false);
+  const [shareData, setShareData] = useState(null);
+  
   const loadAuditLogs = async () => {
     if (!user) { setAuditLogs([]); return; }
     try {
@@ -275,6 +287,26 @@ const ForenseekApp = () => {
       utterance.lang = language === 'es' ? 'es-ES' : language === 'fr' ? 'fr-FR' : 'en-US';
       speechSynthesis.speak(utterance);
     }
+  };
+
+  const handleCollaborate = () => {
+    // Prepare share data based on current context
+    const dataToShare = {
+      type: 'search_results',
+      query: searchQuery,
+      results: searchResults,
+      conversation: allChatHistory,
+      timestamp: new Date().toISOString(),
+      user: user?.email,
+      metadata: {
+        total_results: searchResults.length,
+        conversation_length: allChatHistory.length,
+        search_type: 'forensic_analysis'
+      }
+    };
+    
+    setShareData(dataToShare);
+    setShowShareModal(true);
   };
 
   // eslint-disable-next-line no-restricted-globals
@@ -512,7 +544,7 @@ const ForenseekApp = () => {
                       {t.upload}
                       <input type="file" multiple onChange={handleUpload} className="hidden" />
                     </label>
-                    <button type="button"
+                    <button type="button" onClick={handleCollaborate}
                       className="flex items-center gap-2 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition">
                       <Share2 className="w-4 h-4" />
                       {t.collaborate}
@@ -765,6 +797,14 @@ const ForenseekApp = () => {
 
         </main>
       </div>
+      
+      {/* Share Modal */}
+      <ShareModal 
+        isOpen={showShareModal}
+        onClose={() => setShowShareModal(false)}
+        shareData={shareData}
+        currentUser={user}
+      />
     </div>
   );
 };

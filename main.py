@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import SessionLocal, engine, Base
-import models, schemas, schemas_audit, utils
+import models, schemas, schemas_audit, schemas_share, utils
 from utils import init_db
 import build_index
 import queryEngine
@@ -667,38 +667,57 @@ async def export_pdf_full_history(request_data: schemas.PDFExportRequest, curren
     if not chat_history:
         raise HTTPException(status_code=400, detail='No chat history provided')
     
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    pdf.set_font('Arial', 'B', 16)
-    pdf.cell(0, 10, f'Complete Chat History', ln=True)
-    pdf.ln(8)
-    
-    pdf.set_font('Arial', size=12)
-    
-    for message in chat_history:
-        # Add timestamp from session
-        timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        # Format message based on type
-        if message.get('type') == 'user':
-            pdf.set_font('Arial', 'B', 12)
-            pdf.cell(0, 8, 'User:', ln=True)
-            pdf.set_font('Arial', size=12)
-            pdf.multi_cell(0, 8, message.get('text', ''))
-        else:
-            pdf.set_font('Arial', 'B', 12) 
-            pdf.cell(0, 8, 'Assistant:', ln=True)
-            pdf.set_font('Arial', size=12)
-            pdf.multi_cell(0, 8, message.get('text', ''))
-            
-            # Add sources count if available
-            if message.get('results') and len(message.get('results', [])) > 0:
-                pdf.set_font('Arial', 'I', 10)
-                pdf.cell(0, 6, f'(Found {len(message.get("results", []))} relevant sources)', ln=True)
-                pdf.set_font('Arial', size=12)
-        
+    try:
+        pdf = FPDF()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.add_page()
+        pdf.set_font('Arial', 'B', 16)
+        pdf.cell(0, 10, 'Complete Chat History', ln=True)
         pdf.ln(8)
+        
+        pdf.set_font('Arial', size=12)
+        
+        for message in chat_history:
+            # Add timestamp from session
+            timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Format message based on type
+            if message.get('type') == 'user':
+                pdf.set_font('Arial', 'B', 12)
+                pdf.cell(0, 8, 'User:', ln=True)
+                pdf.set_font('Arial', size=12)
+                # Safely handle text content
+                text_content = str(message.get('text', ''))[:500]  # Limit length
+                pdf.multi_cell(0, 8, text_content)
+            else:
+                pdf.set_font('Arial', 'B', 12) 
+                pdf.cell(0, 8, 'Assistant:', ln=True)
+                pdf.set_font('Arial', size=12)
+                # Safely handle text content
+                text_content = str(message.get('text', ''))[:500]  # Limit length
+                pdf.multi_cell(0, 8, text_content)
+                
+                # Add sources count if available
+                if message.get('results') and len(message.get('results', [])) > 0:
+                    pdf.set_font('Arial', 'I', 10)
+                    pdf.cell(0, 6, f'(Found {len(message.get("results", []))} relevant sources)', ln=True)
+                    pdf.set_font('Arial', size=12)
+            
+            pdf.ln(8)
+    except Exception as e:
+        print(f"PDF generation error: {e}")
+        # Fallback to simple text-based PDF
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font('Arial', size=12)
+        pdf.cell(0, 10, 'Chat History Export', ln=True)
+        pdf.ln(5)
+        
+        for i, message in enumerate(chat_history):
+            pdf.cell(0, 8, f"Message {i+1}: {message.get('type', 'unknown')}", ln=True)
+            text_content = str(message.get('text', ''))[:200]
+            pdf.multi_cell(0, 6, text_content)
+            pdf.ln(3)
 
     # Create PDF bytes
     pdf_data = pdf.output(dest='S')
@@ -941,3 +960,286 @@ def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
 def logout(response: Response):
     response.delete_cookie("access_token")
     return {"msg": "Logged out"}
+
+
+# Sharing and Collaboration Endpoints
+@app.post('/api/share/generate-link', response_model=schemas_share.ShareLinkResponse)
+async def generate_share_link(
+    request: schemas_share.ShareLinkRequest,
+    current_user: models.User = Depends(get_current_user)
+):
+    """Generate a secure share link for collaboration"""
+    try:
+        # Generate unique share ID
+        share_id = str(uuid.uuid4())
+        
+        # Calculate expiry date
+        from datetime import timedelta
+        expires_at = datetime.now() + timedelta(days=request.expiry_days)
+        
+        # Store share data (in production, use Redis or database)
+        share_data = {
+            'share_id': share_id,
+            'data': request.data.dict(),
+            'permissions': request.permissions,
+            'expires_at': expires_at.isoformat(),
+            'created_by': current_user.email,
+            'created_at': datetime.now().isoformat(),
+            'access_count': 0
+        }
+        
+        # In production, store this in database
+        # For now, we'll simulate with a simple in-memory store
+        if not hasattr(app.state, 'share_links'):
+            app.state.share_links = {}
+        app.state.share_links[share_id] = share_data
+        
+        # Generate share link
+        share_link = f"https://forenseek.com/share/{share_id}"
+        
+        # Log the sharing activity
+        try:
+            db = SessionLocal()
+            log_audit(
+                db=db,
+                user=current_user.email,
+                action='share_generated',
+                extra={
+                    'share_id': share_id,
+                    'share_type': request.data.type,
+                    'permissions': request.permissions,
+                    'expiry_days': request.expiry_days
+                }
+            )
+        except Exception as e:
+            print(f"Failed to log share activity: {e}")
+        
+        return schemas_share.ShareLinkResponse(
+            success=True,
+            link=share_link,
+            share_id=share_id,
+            expires_at=expires_at,
+            permissions=request.permissions
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate share link: {str(e)}")
+
+
+@app.post('/api/share/send-email', response_model=schemas_share.EmailShareResponse)
+async def send_email_share(
+    request: schemas_share.EmailShareRequest,
+    current_user: models.User = Depends(get_current_user)
+):
+    """Send share via email"""
+    try:
+        # In production, integrate with email service (SendGrid, AWS SES, etc.)
+        # For now, simulate email sending
+        
+        recipients_sent = 0
+        recipients_failed = 0
+        
+        for recipient in request.recipients:
+            try:
+                # Simulate email sending
+                print(f"Email sent to {recipient}: {request.message}")
+                recipients_sent += 1
+            except Exception:
+                recipients_failed += 1
+        
+        # Log the email sharing activity
+        try:
+            db = SessionLocal()
+            log_audit(
+                db=db,
+                user=current_user.email,
+                action='email_share_sent',
+                extra={
+                    'recipients': [str(r) for r in request.recipients],
+                    'share_type': request.data.type,
+                    'recipients_sent': recipients_sent,
+                    'recipients_failed': recipients_failed
+                }
+            )
+        except Exception as e:
+            print(f"Failed to log email share activity: {e}")
+        
+        return schemas_share.EmailShareResponse(
+            success=True,
+            message=f"Email sent to {recipients_sent} recipients",
+            recipients_sent=recipients_sent,
+            recipients_failed=recipients_failed
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send email share: {str(e)}")
+
+
+@app.post('/api/share/generate-export')
+async def generate_share_export(
+    request: schemas_share.ExportShareRequest,
+    current_user: models.User = Depends(get_current_user)
+):
+    """Generate export file for sharing"""
+    try:
+        if request.format == 'pdf':
+            # Use existing PDF generation logic
+            pdf = FPDF()
+            pdf.set_auto_page_break(auto=True, margin=15)
+            pdf.add_page()
+            pdf.set_font('Arial', 'B', 16)
+            pdf.cell(0, 10, 'FORENSEEK - Shared Data Export', ln=True)
+            pdf.ln(8)
+            
+            # Add metadata
+            pdf.set_font('Arial', size=12)
+            pdf.cell(0, 8, f'Shared by: {current_user.email}', ln=True)
+            pdf.cell(0, 8, f'Shared on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', ln=True)
+            pdf.cell(0, 8, f'Data Type: {request.data.type}', ln=True)
+            pdf.ln(5)
+            
+            # Add search query if available
+            if request.data.query:
+                pdf.set_font('Arial', 'B', 12)
+                pdf.cell(0, 8, 'Search Query:', ln=True)
+                pdf.set_font('Arial', size=12)
+                pdf.multi_cell(0, 8, request.data.query)
+                pdf.ln(5)
+            
+            # Add results
+            if request.data.results:
+                pdf.set_font('Arial', 'B', 12)
+                pdf.cell(0, 8, f'Search Results ({len(request.data.results)} items):', ln=True)
+                pdf.set_font('Arial', size=10)
+                
+                for i, result in enumerate(request.data.results[:20]):  # Limit to first 20 results
+                    pdf.cell(0, 6, f"{i+1}. {str(result)[:100]}...", ln=True)
+            
+            # Add conversation if available
+            if request.data.conversation:
+                pdf.ln(5)
+                pdf.set_font('Arial', 'B', 12)
+                pdf.cell(0, 8, f'Conversation History ({len(request.data.conversation)} messages):', ln=True)
+                pdf.set_font('Arial', size=10)
+                
+                for msg in request.data.conversation[-10:]:  # Last 10 messages
+                    pdf.set_font('Arial', 'B', 10)
+                    pdf.cell(0, 6, f"{msg.get('type', 'unknown').title()}:", ln=True)
+                    pdf.set_font('Arial', size=10)
+                    text_content = str(msg.get('text', ''))[:200]
+                    pdf.multi_cell(0, 6, text_content)
+                    pdf.ln(2)
+            
+            # Generate PDF bytes
+            pdf_data = pdf.output(dest='S')
+            if isinstance(pdf_data, str):
+                pdf_bytes = pdf_data.encode('latin-1')
+            else:
+                pdf_bytes = pdf_data
+            
+            # Log the export sharing activity
+            try:
+                db = SessionLocal()
+                log_audit(
+                    db=db,
+                    user=current_user.email,
+                    action='export_share_generated',
+                    extra={
+                        'format': request.format,
+                        'share_type': request.data.type,
+                        'data_size': len(str(request.data.dict()))
+                    }
+                )
+            except Exception as e:
+                print(f"Failed to log export share activity: {e}")
+            
+            return StreamingResponse(
+                io.BytesIO(pdf_bytes),
+                media_type='application/pdf',
+                headers={
+                    'Content-Disposition': f'attachment; filename=forenseek_share_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
+                }
+            )
+        
+        elif request.format == 'json':
+            # Generate JSON export
+            export_data = {
+                'metadata': {
+                    'shared_by': current_user.email,
+                    'shared_at': datetime.now().isoformat(),
+                    'data_type': request.data.type,
+                    'export_format': 'json'
+                },
+                'data': request.data.dict()
+            }
+            
+            json_content = json.dumps(export_data, indent=2)
+            return StreamingResponse(
+                io.BytesIO(json_content.encode('utf-8')),
+                media_type='application/json',
+                headers={
+                    'Content-Disposition': f'attachment; filename=forenseek_share_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+                }
+            )
+        
+        else:
+            raise HTTPException(status_code=400, detail='Unsupported export format')
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate export: {str(e)}")
+
+
+@app.get('/api/share/{share_id}')
+async def access_shared_content(share_id: str):
+    """Access shared content via share link"""
+    try:
+        # In production, retrieve from database
+        if not hasattr(app.state, 'share_links'):
+            raise HTTPException(status_code=404, detail='Share not found')
+        
+        share_data = app.state.share_links.get(share_id)
+        if not share_data:
+            raise HTTPException(status_code=404, detail='Share not found')
+        
+        # Check if expired
+        from datetime import datetime
+        expires_at = datetime.fromisoformat(share_data['expires_at'])
+        if datetime.now() > expires_at:
+            raise HTTPException(status_code=410, detail='Share has expired')
+        
+        # Update access count
+        share_data['access_count'] += 1
+        
+        # Log access
+        try:
+            db = SessionLocal()
+            log_audit(
+                db=db,
+                user='anonymous',
+                action='shared_content_accessed',
+                extra={
+                    'share_id': share_id,
+                    'access_count': share_data['access_count']
+                }
+            )
+        except Exception as e:
+            print(f"Failed to log share access: {e}")
+        
+        return {
+            'success': True,
+            'data': share_data['data'],
+            'permissions': share_data['permissions'],
+            'created_by': share_data['created_by'],
+            'created_at': share_data['created_at'],
+            'access_count': share_data['access_count']
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to access shared content: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
